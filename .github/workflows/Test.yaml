@@ -1,20 +1,33 @@
-# Custom workflow plumbing; cryptographic primitives come from GnuPG/OpenPGP.
-# Project attribution: Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh (Sami-s.dev).
-# Configure one repository variable GPG_PUBLIC_KEY (one ASCII-armored public key).
-# Keep its matching private decrypt key offline; authorized users can each hold a copy.
-# Everyone with that private key can decrypt every backup; rotate it to revoke access.
-# Checks detect corruption and provide public-repo provenance; they cannot prevent
-# a privileged account from deleting or replacing a backup.
+# FERROWORKS encrypted Git recovery workflow.
+# Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
+# This workflow intentionally has no pull_request trigger.
 #
-# Offline restore after downloading both artifact files:
-#   sha256sum --check ferroworks-<commit>.backup.tar.gpg.sha256
-#   gpg --output ferroworks-backup.tar --decrypt ferroworks-<commit>.backup.tar.gpg
-#   mkdir restore-files && tar -xf ferroworks-backup.tar -C restore-files
+# ONE-FILE SETUP:
+# 1. Add this YAML file at .github/workflows/ferroworks-encrypted-recovery.yml.
+# 2. Generate an RSA key pair offline:
+#      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out backup-private.pem
+#      openssl pkey -in backup-private.pem -pubout -out backup-public.pem
+# 3. Save the contents of backup-public.pem as the repository variable
+#    BACKUP_RECIPIENT_PUBLIC_KEY. Never add the private key to GitHub.
+#
+# OFFLINE RESTORE:
+# Save this YAML file separately. Extract its embedded helper with:
+#   awk '/^          # BEGIN_HYBRID_HELPER$/{inside=1;next} /^          # END_HYBRID_HELPER$/{inside=0;exit} inside{sub(/^          /,"");print}' \
+#     .github/workflows/ferroworks-encrypted-recovery.yml > ferroworks_hybrid_encrypt.py
+# Then verify and decrypt the downloaded artifact:
+#   sha256sum --check ferroworks-<commit>.backup.fwenc.sha256
+#   python3 ferroworks_hybrid_encrypt.py decrypt --private-key backup-private.pem \
+#     --input ferroworks-<commit>.backup.fwenc --output ferroworks-backup.tar
+#   mkdir restore-files
+#   tar -xf ferroworks-backup.tar -C restore-files
 #   (cd restore-files && sha256sum --check package.sha256)
-#   git clone ./restore-files/repository.bundle restored-repository
-# Public-repository provenance check (this workflow attests public repositories only):
-#   gh attestation verify ferroworks-<commit>.backup.tar.gpg -R owner/repository
-name: FERROWORKS security and encrypted recovery
+#   git clone restore-files/repository.bundle restored-repository
+#
+# Envelope: RSA-OAEP-SHA256 key wrap + AES-256-CBC + HMAC-SHA256.
+# The workflow uses GitHub's official checkout and artifact services, but no
+# OpenPGP, third-party encryption API, secret-scanning service, or attestation.
+
+name: FERROWORKS encrypted recovery
 
 on:
   push:
@@ -22,11 +35,6 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
-      run_checks:
-        description: Run the secret scan
-        type: boolean
-        required: true
-        default: true
       create_encrypted_backup:
         description: Create and upload an encrypted Git backup
         type: boolean
@@ -37,33 +45,8 @@ permissions:
   contents: read
 
 jobs:
-  # Runs only on the trusted default branch; this workflow intentionally has no PR trigger.
-  secret-scan:
-    name: Scan Git history for secrets
-    if: >-
-      ${{
-        github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-        (github.event_name != 'workflow_dispatch' || inputs.run_checks)
-      }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Check out full repository history
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Scan with Gitleaks
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Keep scan reports out of separate, unencrypted workflow artifacts.
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          GITLEAKS_ENABLE_COMMENTS: "false"
-
   encrypted-backup:
-    name: Create encrypted and verified Git backup
+    name: Create and upload encrypted Git backup
     if: >-
       ${{
         github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
@@ -71,10 +54,6 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
     steps:
       - name: Check out full repository history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -82,91 +61,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Self-test GnuPG AES-256 encryption and decryption
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          test_dir="$RUNNER_TEMP/gpg-self-test"
-          mkdir -m 0700 "$test_dir"
-          trap 'rm -rf -- "$test_dir"' EXIT
-
-          command -v gpg
-          gpg --version | head -n 1
-          openssl rand -hex 32 > "$test_dir/passphrase"
-          printf '%s\n' "GnuPG workflow self-test" > "$test_dir/plaintext"
-          gpg --homedir "$test_dir" --batch --yes --no-tty \
-            --pinentry-mode loopback --passphrase-file "$test_dir/passphrase" \
-            --symmetric --cipher-algo AES256 \
-            --output "$test_dir/ciphertext.gpg" "$test_dir/plaintext"
-          gpg --homedir "$test_dir" --batch --yes --no-tty \
-            --pinentry-mode loopback --passphrase-file "$test_dir/passphrase" \
-            --output "$test_dir/restored" --decrypt "$test_dir/ciphertext.gpg"
-          cmp --silent "$test_dir/plaintext" "$test_dir/restored"
-
-      - name: Import and verify the OpenPGP recipient
+      - name: Build and encrypt backup
         shell: bash
         env:
-          GPG_PUBLIC_KEY: ${{ vars.GPG_PUBLIC_KEY }}
+          BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           umask 077
-          if [[ -z "${GPG_PUBLIC_KEY:-}" ]]; then
-            echo "::error title=Encryption is not configured::Set the repository variable GPG_PUBLIC_KEY."
+
+          if [[ -z "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
+            echo "::error title=Encryption is not configured::Set the repository variable BACKUP_RECIPIENT_PUBLIC_KEY to one PEM-encoded RSA public key."
             exit 1
           fi
 
-          gpg_home="$RUNNER_TEMP/gnupg"
-          public_key="$RUNNER_TEMP/ferroworks-recipient.asc"
-          mkdir -m 0700 "$gpg_home"
-          export GNUPGHOME="$gpg_home"
-          printf '%s\n' "$GPG_PUBLIC_KEY" > "$public_key"
-          gpg --batch --no-tty --import "$public_key"
+          work_dir="$RUNNER_TEMP/ferroworks-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          artifact_dir="$RUNNER_TEMP/ferroworks-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          public_key="$RUNNER_TEMP/ferroworks-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
+          mkdir -m 0700 "$work_dir" "$artifact_dir"
+          trap 'rm -rf -- "$work_dir"; rm -f -- "$public_key"' EXIT
 
-          primary_key_count="$(gpg --batch --with-colons --show-keys "$public_key" |
-            awk -F: '$1 == "pub" { count++ } END { print count+0 }')"
-          if [[ "$primary_key_count" != "1" ]]; then
-            echo "::error title=Expected one OpenPGP key::GPG_PUBLIC_KEY must contain exactly one primary public key."
-            exit 1
-          fi
-          actual="$(gpg --batch --with-colons --show-keys "$public_key" |
-            awk -F: '$1 == "fpr" && !found { print toupper($10); found=1 }')"
-          if [[ ! "$actual" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]]; then
-            echo "::error title=Invalid OpenPGP key::Could not derive the full primary-key fingerprint."
-            exit 1
-          fi
-          if ! gpg --batch --with-colons --list-keys "$actual" |
-            awk -F: '($1 == "pub" || $1 == "sub") && $12 ~ /e/ { found=1 } END { exit !found }'; then
-            echo "::error title=Recipient cannot encrypt::The selected OpenPGP key has no encryption-capable key."
-            exit 1
-          fi
+          printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$public_key"
+          chmod 0600 "$public_key"
 
-          rm -f -- "$public_key"
-          echo "GNUPGHOME=$gpg_home" >> "$GITHUB_ENV"
-          echo "GPG_RECIPIENT_FINGERPRINT=$actual" >> "$GITHUB_ENV"
+          bundle="$work_dir/repository.bundle"
+          package_dir="$work_dir/package"
+          payload="$work_dir/ferroworks-${GITHUB_SHA}.backup.tar"
+          encrypted="$artifact_dir/ferroworks-${GITHUB_SHA}.backup.fwenc"
+          mkdir -m 0700 "$package_dir"
 
-      - name: Create and verify Git bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          # A Git bundle captures history and refs, not Git LFS payload objects.
-          bundle="$RUNNER_TEMP/ferroworks-${GITHUB_SHA}.bundle"
-          git bundle create "$bundle" --all
+          git bundle create "$bundle" --all HEAD
           git bundle verify "$bundle"
-          echo "BUNDLE_PATH=$bundle" >> "$GITHUB_ENV"
-
-      - name: Add copyright notice and integrity manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          bundle="${BUNDLE_PATH:?Git bundle path is missing}"
-          package_dir="$RUNNER_TEMP/ferroworks-package"
-          verify_dir="$RUNNER_TEMP/ferroworks-package-verify"
-          payload="$RUNNER_TEMP/ferroworks-${GITHUB_SHA}.backup.tar"
-          mkdir -m 0700 "$package_dir" "$verify_dir"
-          trap 'rm -f -- "$bundle"; rm -rf -- "$package_dir" "$verify_dir"' EXIT
-
           cp -- "$bundle" "$package_dir/repository.bundle"
+
           cat > "$package_dir/COPYRIGHT.txt" <<'NOTICE'
           Copyright © 2025 FERROWORKS.
           Project lead: Samrath "Sami" Singh (Sami-s.dev), Full-Stack Developer & Software Engineer.
@@ -175,24 +101,18 @@ jobs:
           Unauthorized tampering may violate applicable license terms or law.
           This notice does not replace or modify any license or notice in the backed-up repository.
           NOTICE
-          grep -Fqx 'Copyright © 2025 FERROWORKS.' \
-            "$package_dir/COPYRIGHT.txt"
-          grep -Fq 'Project lead: Samrath "Sami" Singh (Sami-s.dev)' \
-            "$package_dir/COPYRIGHT.txt"
-          grep -Fq 'Do not alter, remove, or misrepresent this notice' \
-            "$package_dir/COPYRIGHT.txt"
 
           bundle_digest="$(sha256sum "$package_dir/repository.bundle" | awk '{print $1}')"
           {
             echo "FERROWORKS encrypted Git backup"
             echo "copyright=Copyright © 2025 FERROWORKS."
             echo "project_lead=Samrath Sami Singh (Sami-s.dev)"
-            echo "project_site=https://sami-s.dev"
-            echo "notice=Do not alter, remove, or misrepresent this notice or the integrity manifest."
             echo "commit=$GITHUB_SHA"
             echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "git_bundle_sha256=$bundle_digest"
-            echo "integrity=package SHA-256 plus OpenPGP encrypted-data integrity"
+            echo "contents=Git refs and HEAD"
+            echo "limitations=Does not include uncommitted files, untracked files, or Git LFS payload objects."
+            echo "envelope=FWENC001; RSA-OAEP-SHA256 key wrapping; AES-256-CBC; HMAC-SHA256"
           } > "$package_dir/MANIFEST.txt"
 
           (
@@ -200,65 +120,260 @@ jobs:
             sha256sum COPYRIGHT.txt MANIFEST.txt repository.bundle > package.sha256
             sha256sum --check package.sha256
           )
+
           tar --create --file="$payload" --directory="$package_dir" \
             --sort=name --mtime='UTC 1970-01-01' \
             --owner=0 --group=0 --numeric-owner --format=posix .
           tar --list --file="$payload" >/dev/null
-          tar --extract --file="$payload" --directory="$verify_dir"
-          (cd "$verify_dir" && sha256sum --check package.sha256)
-          echo "PAYLOAD_PATH=$payload" >> "$GITHUB_ENV"
 
-      - name: Encrypt backup before upload
-        shell: bash
-        run: |
-          set -euo pipefail
-          payload="${PAYLOAD_PATH:?Backup package path is missing}"
-          bundle="${BUNDLE_PATH:?Git bundle path is missing}"
-          trap 'rm -f -- "$payload" "$bundle"' EXIT
-          if [[ -z "${GPG_RECIPIENT_FINGERPRINT:-}" || ! -d "${GNUPGHOME:-}" ]]; then
-            echo "::error title=OpenPGP recipient is unavailable::The recipient import step did not complete."
-            exit 1
-          fi
+          helper="$work_dir/ferroworks_hybrid_encrypt.py"
+          cat > "$helper" <<'PYHELPER'
+          # BEGIN_HYBRID_HELPER
+          #!/usr/bin/env python3
+          import argparse
+          import hashlib
+          import hmac
+          import os
+          import re
+          import shutil
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
 
-          encrypted="${payload}.gpg"
-          gpg --homedir "$GNUPGHOME" --batch --yes --no-tty \
-            --trust-model always --recipient "$GPG_RECIPIENT_FINGERPRINT" \
-            --cipher-algo AES256 --set-filename "ferroworks-backup.tar" \
-            --output "$encrypted" --encrypt "$payload"
-          test -s "$encrypted"
-          gpg --homedir "$GNUPGHOME" --batch --list-packets "$encrypted" >/dev/null
-          rm -f -- "$payload" "$bundle"
-          checksum_file="${encrypted}.sha256"
+          MAGIC = b"FWENC001"
+          VERSION = 1
+          ITERATIONS = 600_000
+          SALT_BYTES = 16
+          MASTER_BYTES = 64
+          TAG_BYTES = 32
+          HEADER = struct.Struct(">8sBI16sH")
+          MAC_LABEL = b"FERROWORKS-FWENC-MAC-v1"
+
+          class Failure(Exception):
+              pass
+
+          def openssl():
+              path = shutil.which("openssl")
+              if not path:
+                  raise Failure("OpenSSL was not found.")
+              result = subprocess.run([path, "version"], capture_output=True, text=True)
+              if result.returncode or not result.stdout.startswith("OpenSSL 3."):
+                  raise Failure("OpenSSL 3.x is required.")
+              return path
+
+          def checked(args, message):
+              result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              if result.returncode:
+                  detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+                  raise Failure(message + (": " + detail[-1] if detail else ""))
+
+          def mac_key(master):
+              return hmac.new(master, MAC_LABEL, hashlib.sha256).digest()
+
+          def crypt(openssl_path, decrypt, salt, passfile, source, destination):
+              args = [
+                  openssl_path, "enc", "-aes-256-cbc", "-pbkdf2", "-iter", str(ITERATIONS),
+                  "-md", "sha256", "-saltlen", str(SALT_BYTES), "-S", salt.hex(),
+                  "-pass", "file:" + str(passfile), "-in", str(source), "-out", str(destination),
+              ]
+              if decrypt:
+                  args.insert(2, "-d")
+              checked(args, "AES encryption/decryption failed")
+
+          def publish(temp_path, output):
+              try:
+                  os.link(temp_path, output)
+              except FileExistsError:
+                  raise Failure("Output already exists: " + str(output))
+              temp_path.unlink()
+
+          def encrypt(source, public_key, output):
+              openssl_path = openssl()
+              source, public_key, output = source.resolve(), public_key.resolve(), output.resolve()
+              if not source.is_file() or not public_key.is_file():
+                  raise Failure("Input file or public key does not exist.")
+              output.parent.mkdir(parents=True, exist_ok=True)
+              key_info = subprocess.run(
+                  [openssl_path, "rsa", "-pubin", "-in", str(public_key), "-noout", "-text"],
+                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+              )
+              match = re.search(r"Public-Key:\s*\((\d+)\s+bit\)", key_info.stdout)
+              if key_info.returncode or not match or int(match.group(1)) < 2048:
+                  raise Failure("Use a PEM RSA public key of at least 2048 bits.")
+              work = Path(tempfile.mkdtemp(prefix="fwenc-"))
+              os.chmod(work, 0o700)
+              temp_output = None
+              try:
+                  master = os.urandom(MASTER_BYTES)
+                  key_file = work / "master.key"
+                  key_file.write_bytes(master)
+                  os.chmod(key_file, 0o600)
+                  wrapped_file = work / "wrapped.key"
+                  checked([
+                      openssl_path, "pkeyutl", "-encrypt", "-pubin", "-inkey", str(public_key),
+                      "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
+                      "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(key_file), "-out", str(wrapped_file),
+                  ], "RSA-OAEP key wrapping failed")
+                  wrapped = wrapped_file.read_bytes()
+                  if not wrapped or len(wrapped) > 65535:
+                      raise Failure("Invalid wrapped-key size.")
+                  salt = os.urandom(SALT_BYTES)
+                  header = HEADER.pack(MAGIC, VERSION, ITERATIONS, salt, len(wrapped)) + wrapped
+                  passfile = work / "passphrase.txt"
+                  passfile.write_text(master.hex() + "\n", encoding="ascii")
+                  os.chmod(passfile, 0o600)
+                  ciphertext = work / "ciphertext.bin"
+                  crypt(openssl_path, False, salt, passfile, source, ciphertext)
+                  mac = hmac.new(mac_key(master), digestmod=hashlib.sha256)
+                  mac.update(header)
+                  with ciphertext.open("rb") as stream:
+                      for block in iter(lambda: stream.read(1024 * 1024), b""):
+                          mac.update(block)
+                  with tempfile.NamedTemporaryFile(prefix=".fwenc-", dir=output.parent, delete=False) as out:
+                      temp_output = Path(out.name)
+                      os.chmod(temp_output, 0o600)
+                      out.write(header)
+                      with ciphertext.open("rb") as stream:
+                          shutil.copyfileobj(stream, out, 1024 * 1024)
+                      out.write(mac.digest())
+                      out.flush()
+                      os.fsync(out.fileno())
+                  publish(temp_output, output)
+                  temp_output = None
+                  print(output)
+              finally:
+                  if temp_output:
+                      temp_output.unlink(missing_ok=True)
+                  shutil.rmtree(work, ignore_errors=True)
+
+          def decrypt(source, private_key, output):
+              openssl_path = openssl()
+              source, private_key, output = source.resolve(), private_key.resolve(), output.resolve()
+              if not source.is_file() or not private_key.is_file():
+                  raise Failure("Encrypted input or private key does not exist.")
+              if output.exists():
+                  raise Failure("Output already exists: " + str(output))
+              output.parent.mkdir(parents=True, exist_ok=True)
+              work = Path(tempfile.mkdtemp(prefix="fwdec-"))
+              os.chmod(work, 0o700)
+              temp_output = None
+              try:
+                  size = source.stat().st_size
+                  with source.open("rb") as stream:
+                      prefix = stream.read(HEADER.size)
+                      if len(prefix) != HEADER.size:
+                          raise Failure("Invalid FWENC file.")
+                      magic, version, iterations, salt, wrapped_len = HEADER.unpack(prefix)
+                      if magic != MAGIC or version != VERSION or iterations != ITERATIONS or wrapped_len < 256:
+                          raise Failure("Unsupported or invalid FWENC format.")
+                      wrapped = stream.read(wrapped_len)
+                      if len(wrapped) != wrapped_len:
+                          raise Failure("Truncated wrapped key.")
+                      header = prefix + wrapped
+                      cipher_len = size - len(header) - TAG_BYTES
+                      if cipher_len < 16 or cipher_len % 16:
+                          raise Failure("Invalid or truncated ciphertext.")
+                      cipher = work / "ciphertext.bin"
+                      with cipher.open("xb") as out:
+                          remaining = cipher_len
+                          while remaining:
+                              block = stream.read(min(1024 * 1024, remaining))
+                              if not block:
+                                  raise Failure("Truncated ciphertext.")
+                              out.write(block)
+                              remaining -= len(block)
+                      tag = stream.read(TAG_BYTES)
+                      if len(tag) != TAG_BYTES or stream.read(1):
+                          raise Failure("Invalid authentication tag or trailing data.")
+                  wrapped_file = work / "wrapped.key"
+                  wrapped_file.write_bytes(wrapped)
+                  key_file = work / "master.key"
+                  # An encrypted offline private key may prompt for its passphrase here.
+                  result = subprocess.run([
+                      openssl_path, "pkeyutl", "-decrypt", "-inkey", str(private_key),
+                      "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
+                      "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(wrapped_file), "-out", str(key_file),
+                  ])
+                  if result.returncode or not key_file.is_file():
+                      raise Failure("Could not unwrap the backup key.")
+                  master = key_file.read_bytes()
+                  if len(master) != MASTER_BYTES:
+                      raise Failure("Invalid unwrapped key.")
+                  mac = hmac.new(mac_key(master), digestmod=hashlib.sha256)
+                  mac.update(header)
+                  with cipher.open("rb") as stream:
+                      for block in iter(lambda: stream.read(1024 * 1024), b""):
+                          mac.update(block)
+                  if not hmac.compare_digest(mac.digest(), tag):
+                      raise Failure("Authentication failed: damaged backup or wrong private key.")
+                  passfile = work / "passphrase.txt"
+                  passfile.write_text(master.hex() + "\n", encoding="ascii")
+                  payload = work / "decrypted.tar"
+                  crypt(openssl_path, True, salt, passfile, cipher, payload)
+                  with tempfile.NamedTemporaryFile(prefix=".fwplain-", dir=output.parent, delete=False) as out:
+                      temp_output = Path(out.name)
+                      os.chmod(temp_output, 0o600)
+                      with payload.open("rb") as stream:
+                          shutil.copyfileobj(stream, out, 1024 * 1024)
+                      out.flush()
+                      os.fsync(out.fileno())
+                  publish(temp_output, output)
+                  temp_output = None
+                  print(output)
+              finally:
+                  if temp_output:
+                      temp_output.unlink(missing_ok=True)
+                  shutil.rmtree(work, ignore_errors=True)
+
+          def main():
+              parser = argparse.ArgumentParser()
+              sub = parser.add_subparsers(dest="mode", required=True)
+              enc = sub.add_parser("encrypt")
+              enc.add_argument("--public-key", type=Path, required=True)
+              enc.add_argument("--input", type=Path, required=True)
+              enc.add_argument("--output", type=Path, required=True)
+              dec = sub.add_parser("decrypt")
+              dec.add_argument("--private-key", type=Path, required=True)
+              dec.add_argument("--input", type=Path, required=True)
+              dec.add_argument("--output", type=Path, required=True)
+              args = parser.parse_args()
+              try:
+                  if args.mode == "encrypt":
+                      encrypt(args.input, args.public_key, args.output)
+                  else:
+                      decrypt(args.input, args.private_key, args.output)
+              except (Failure, OSError) as exc:
+                  print("error: " + str(exc), file=sys.stderr)
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          # END_HYBRID_HELPER
+          PYHELPER
+          chmod 0700 "$helper"
+
+          python3 "$helper" encrypt \
+            --public-key "$public_key" \
+            --input "$payload" \
+            --output "$encrypted"
+
           (
-            cd "$RUNNER_TEMP"
-            sha256sum "$(basename "$encrypted")" > "$(basename "$checksum_file")"
-            sha256sum --check "$(basename "$checksum_file")"
+            cd "$artifact_dir"
+            sha256sum "$(basename "$encrypted")" > "$(basename "$encrypted").sha256"
+            sha256sum --check "$(basename "$encrypted").sha256"
           )
 
-          digest="$(sha256sum "$encrypted" | awk '{print $1}')"
-          {
-            echo "### Encrypted OpenPGP Git backup"
-            echo
-            echo "- Ciphertext: \`$(basename "$encrypted")\`"
-            echo "- SHA-256: \`$digest\`"
-            echo "- Copyright notice and package manifest are inside the encrypted package."
-            echo "- Plaintext bundle and package removed before upload."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Public repositories get a Sigstore-backed provenance attestation for the ciphertext.
-      - name: Attest encrypted backup provenance
-        if: github.event.repository.private == false
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: ${{ runner.temp }}/ferroworks-${{ github.sha }}.backup.tar.gpg
+          # Plaintext package and Git bundle are removed before the artifact step.
+          rm -rf -- "$work_dir"
+          rm -f -- "$public_key"
 
       - name: Upload encrypted backup
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ferroworks-openpgp-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/ferroworks-${{ github.sha }}.backup.tar.gpg
-            ${{ runner.temp }}/ferroworks-${{ github.sha }}.backup.tar.gpg.sha256
+          name: ferroworks-encrypted-${{ github.sha }}
+          path: ${{ runner.temp }}/ferroworks-artifact-${{ github.run_id }}-${{ github.run_attempt }}/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
