@@ -1,6 +1,8 @@
 # FERROWORKS encrypted Git recovery workflow.
 # Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
 # This workflow intentionally has no pull_request trigger.
+# Manual dispatch encrypts the exact commit SHA for the branch/ref selected in
+# GitHub Actions. Push and scheduled runs remain limited to the default branch.
 #
 # ONE-FILE SETUP:
 # 1. Add this YAML file at .github/workflows/ferroworks-encrypted-recovery.yml.
@@ -36,12 +38,6 @@ on:
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
-    inputs:
-      create_encrypted_backup:
-        description: Create and upload an encrypted Git backup
-        type: boolean
-        required: true
-        default: false
 
 permissions:
   contents: read
@@ -51,8 +47,8 @@ jobs:
     name: Create and upload encrypted Git backup
     if: >-
       ${{
-        github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-        (github.event_name != 'workflow_dispatch' || inputs.create_encrypted_backup)
+        github.event_name == 'workflow_dispatch' ||
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -60,6 +56,7 @@ jobs:
       - name: Check out full repository history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -109,7 +106,10 @@ jobs:
             echo "FERROWORKS encrypted Git backup"
             echo "copyright=Copyright © 2025 FERROWORKS."
             echo "project_lead=Samrath Sami Singh (Sami-s.dev)"
+            echo "branch=$GITHUB_REF_NAME"
+            echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
+            echo "trigger=$GITHUB_EVENT_NAME"
             echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "git_bundle_sha256=$bundle_digest"
             echo "contents=Git refs and HEAD"
