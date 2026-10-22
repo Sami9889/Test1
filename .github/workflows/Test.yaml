@@ -177,7 +177,7 @@ jobs:
           def crypt(openssl_path, decrypt, salt, passfile, source, destination):
               args = [
                   openssl_path, "enc", "-aes-256-cbc", "-pbkdf2", "-iter", str(ITERATIONS),
-                  "-md", "sha256", "-saltlen", str(SALT_BYTES), "-S", salt.hex(),
+                  "-md", "sha256", "-S", salt.hex(),
                   "-pass", "file:" + str(passfile), "-in", str(source), "-out", str(destination),
               ]
               if decrypt:
