@@ -1,4 +1,4 @@
- FERROWORKS encrypted Git recovery workflow.
+# FERROWORKS encrypted Git recovery workflow.
 # Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
 # This workflow intentionally has no pull_request trigger.
 # Manual dispatch encrypts the exact commit SHA for the branch/ref selected in
