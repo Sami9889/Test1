@@ -8,7 +8,9 @@
 #      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out backup-private.pem
 #      openssl pkey -in backup-private.pem -pubout -out backup-public.pem
 # 3. Save the contents of backup-public.pem as the repository variable
-#    BACKUP_RECIPIENT_PUBLIC_KEY. Never add the private key to GitHub.
+#    BACKUP_RECIPIENT_PUBLIC_KEY. A repository secret with the same name also
+#    works. Environment-scoped values require adding that named environment to
+#    the job. Never add the private key to GitHub.
 #
 # OFFLINE RESTORE:
 # Save this YAML file separately. Extract its embedded helper with:
@@ -64,13 +66,13 @@ jobs:
       - name: Build and encrypt backup
         shell: bash
         env:
-          BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY }}
+          BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           umask 077
 
           if [[ -z "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
-            echo "::error title=Encryption is not configured::Set the repository variable BACKUP_RECIPIENT_PUBLIC_KEY to one PEM-encoded RSA public key."
+            echo "::error title=Recipient key unavailable::Set BACKUP_RECIPIENT_PUBLIC_KEY as a repository variable or repository secret in this same repository. Environment-scoped values require the matching job environment."
             exit 1
           fi
 
