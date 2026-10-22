@@ -1,32 +1,41 @@
 # FERROWORKS encrypted Git recovery workflow.
 # Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
 # This workflow intentionally has no pull_request trigger.
-# Manual dispatch encrypts the exact commit SHA for the branch/ref selected in
-# GitHub Actions. Push and scheduled runs remain limited to the default branch.
+# Manual dispatch can create a Git backup or encrypt/decrypt one tracked file
+# in place on the selected branch. Push and scheduled runs back up the default branch.
 #
 # ONE-FILE SETUP:
 # 1. Add this YAML file at .github/workflows/ferroworks-encrypted-recovery.yml.
 # 2. Generate an RSA key pair offline:
 #      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out backup-private.pem
 #      openssl pkey -in backup-private.pem -pubout -out backup-public.pem
-# 3. Add one public PEM per teammate under .github/backup-recipients/*.pem.
-#    Public keys may be committed; never add private keys to GitHub.
-#    The BACKUP_RECIPIENT_PUBLIC_KEY repository variable/secret remains
-#    supported as an additional recipient for compatibility.
+# 3. Add one public PEM per teammate under .github/backup-recipients/*.pem,
+#    or paste a recipient public PEM into the manual-dispatch input.
+#    Public keys may be committed; never add private keys to Git or dispatch inputs.
+#    The BACKUP_RECIPIENT_PUBLIC_KEY repository variable/secret remains supported.
 # 4. Protect changes to .github/backup-recipients with branch protection and
 #    required review. Removing a key affects future backups only; it cannot
-#    revoke artifacts already downloaded or encrypted for that key.
+#    revoke encrypted backups already committed or downloaded.
 # 5. This design commits ciphertext to the source branch as requested. Later
 #    full-history bundles therefore contain earlier encrypted-backup commits.
 #    The workflow requires GitHub Actions to have contents:write permission;
 #    protected branches may require a pull-request-based publishing strategy.
+# 6. Manual encrypt-file/decrypt-file replaces the selected tracked file in
+#    place and commits it. Encryption does not erase plaintext from old Git
+#    history; decrypt-file commits plaintext to the selected branch.
+# 7. For decrypt-file/verify-file, add BACKUP_DECRYPT_PRIVATE_KEY and, when
+#    passphrase-protected, BACKUP_DECRYPT_PASSPHRASE as repository secrets.
+#    Private keys and passphrases are never accepted as dispatch inputs.
+# 8. In Run workflow, choose an operation and enter the tracked repository-relative
+#    file_path. encrypt-file/decrypt-file replace and commit the file; verify-file
+#    checks its authentication tag without changing or committing it.
 #
 # OFFLINE RESTORE:
 # Save this YAML file separately. Extract its embedded helper with:
 #   awk '/^          # BEGIN_HYBRID_HELPER$/{inside=1;next} /^          # END_HYBRID_HELPER$/{inside=0;exit} inside{sub(/^          /,"");print}' \
 #     .github/workflows/ferroworks-encrypted-recovery.yml > ferroworks_hybrid_encrypt.py
-# Then verify and decrypt the downloaded artifact:
-#   sha256sum --check ferroworks-<commit>.backup.fwenc.sha256
+# Then verify and decrypt the committed backup file:
+#   sha256sum --check ferroworks-<commit>-<run>-<attempt>.backup.fwenc.sha256
 #   python3 ferroworks_hybrid_encrypt.py decrypt --private-key backup-private.pem \
 #     --input ferroworks-<commit>.backup.fwenc --output ferroworks-backup.tar
 #   mkdir restore-files
@@ -35,8 +44,8 @@
 #   git clone restore-files/repository.bundle restored-repository
 #
 # Envelope: RSA-OAEP-SHA256 key wrap + AES-256-CBC + HMAC-SHA256.
-# The recipient list has no configured count cap; practical runner and artifact
-# storage limits still apply.
+# The recipient list has no configured count cap; practical runner and Git
+# repository limits still apply.
 # The workflow uses GitHub's official checkout and branch write permission, but no
 # OpenPGP, third-party encryption API, secret-scanning service, or attestation.
 
@@ -47,20 +56,39 @@ on:
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: "Back up, encrypt/decrypt a tracked file, or verify an encrypted file"
+        required: true
+        type: choice
+        default: git-backup
+        options:
+          - git-backup
+          - encrypt-file
+          - decrypt-file
+          - verify-file
+      file_path:
+        description: "Repository-relative tracked file path for encrypt/decrypt/verify"
+        required: false
+        type: string
+      recipient_public_key:
+        description: "Optional PEM RSA public key for this run only; never paste a private key"
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   encrypted-backup:
-    name: Encrypt selected commit and commit backup
+    name: Back up repository or encrypt/decrypt one file
     if: >-
       ${{
         (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/')) ||
         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 120
     steps:
       - name: Check out full repository history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -69,19 +97,59 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Build and encrypt backup
+      - name: Encrypt, decrypt, or back up
         shell: bash
         env:
+          OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'git-backup' }}
+          FILE_PATH: ${{ inputs.file_path }}
+          DISPATCH_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
           BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
+          BACKUP_DECRYPT_PRIVATE_KEY: ${{ secrets.BACKUP_DECRYPT_PRIVATE_KEY }}
+          BACKUP_DECRYPT_PASSPHRASE: ${{ secrets.BACKUP_DECRYPT_PASSPHRASE }}
         run: |
           set -euo pipefail
           umask 077
+          operation="${OPERATION:-git-backup}"
+          file_path="${FILE_PATH:-}"
+          case "$operation" in
+            git-backup|encrypt-file|decrypt-file|verify-file) ;;
+            *) echo "::error::Unsupported operation."; exit 1 ;;
+          esac
 
           work_dir="$RUNNER_TEMP/ferroworks-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           artifact_dir="$RUNNER_TEMP/ferroworks-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          public_key="$RUNNER_TEMP/ferroworks-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
+          configured_public_key="$RUNNER_TEMP/ferroworks-configured-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
+          dispatch_public_key="$RUNNER_TEMP/ferroworks-dispatch-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
+          selected_output=""
           mkdir -m 0700 "$work_dir" "$artifact_dir"
-          trap 'rm -rf -- "$work_dir" "$artifact_dir"; rm -f -- "$public_key"' EXIT
+          trap 'rm -rf -- "$work_dir" "$artifact_dir"; rm -f -- "$configured_public_key" "$dispatch_public_key"; if [[ -n "$selected_output" ]]; then rm -f -- "$selected_output"; fi' EXIT
+
+          append_ciphertext_preview() {
+            local encrypted_path="$1"
+            python3 - "$encrypted_path" <<'PYCIPHERPREVIEW' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import sys
+
+          payload = Path(sys.argv[1]).read_bytes()
+          preview = payload[:192]
+          glyphs = "FWK!$%&*+-=?@^_#"
+          encoded = "".join(glyphs[value >> 4] + glyphs[value & 0x0F] for value in preview)
+          width = 81
+          title = " FERROWORKS // FWENC003 / CUSTOM GLYPH STREAM "
+          print()
+          print(f"FWENC003 • {len(payload):,} encrypted bytes • custom glyph preview / first {len(preview):,} bytes")
+          print("```text")
+          print("┌" + title + "─" * (width - len(title) - 2) + "┐")
+          for row, start in enumerate(range(0, len(encoded), 64)):
+              chunk = encoded[start:start + 64]
+              groups = " ".join(chunk[index:index + 8] for index in range(0, len(chunk), 8))
+              print(f"│ {row * 32:04X}  {groups:<71} │")
+          if len(payload) > len(preview):
+              print(f"Preview truncated: {len(payload) - len(preview):,} additional encrypted bytes remain in the file.")
+          print("└" + "─" * (width - 2) + "┘")
+          print("```")
+          PYCIPHERPREVIEW
+          }
 
           recipient_keys=()
           recipient_args=()
@@ -90,12 +158,17 @@ jobs:
             recipient_keys+=("$key")
           done
           if [[ -n "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
-            printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$public_key"
-            chmod 0600 "$public_key"
-            recipient_keys+=("$public_key")
+            printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$configured_public_key"
+            chmod 0600 "$configured_public_key"
+            recipient_keys+=("$configured_public_key")
           fi
-          if (( ${#recipient_keys[@]} == 0 )); then
-            echo "::error title=Recipients not configured::Add PEM RSA public keys under .github/backup-recipients/ or set BACKUP_RECIPIENT_PUBLIC_KEY."
+          if [[ -n "${DISPATCH_RECIPIENT_PUBLIC_KEY:-}" ]]; then
+            printf '%s\n' "$DISPATCH_RECIPIENT_PUBLIC_KEY" > "$dispatch_public_key"
+            chmod 0600 "$dispatch_public_key"
+            recipient_keys+=("$dispatch_public_key")
+          fi
+          if [[ "$operation" == "git-backup" || "$operation" == "encrypt-file" ]] && (( ${#recipient_keys[@]} == 0 )); then
+            echo "::error title=Recipients not configured::Paste a PEM RSA public key into the dispatch input, add keys under .github/backup-recipients/, or set BACKUP_RECIPIENT_PUBLIC_KEY."
             exit 1
           fi
           for key in "${recipient_keys[@]}"; do
@@ -106,13 +179,13 @@ jobs:
           package_dir="$work_dir/package"
           payload="$work_dir/ferroworks-${GITHUB_SHA}.backup.tar"
           encrypted="$artifact_dir/ferroworks-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.backup.fwenc"
-          mkdir -m 0700 "$package_dir"
+          if [[ "$operation" == "git-backup" ]]; then
+            mkdir -m 0700 "$package_dir"
+            git bundle create "$bundle" --all HEAD
+            git bundle verify "$bundle"
+            cp -- "$bundle" "$package_dir/repository.bundle"
 
-          git bundle create "$bundle" --all HEAD
-          git bundle verify "$bundle"
-          cp -- "$bundle" "$package_dir/repository.bundle"
-
-          cat > "$package_dir/COPYRIGHT.txt" <<'NOTICE'
+            cat > "$package_dir/COPYRIGHT.txt" <<'NOTICE'
           Copyright © 2025 FERROWORKS.
           Project lead: Samrath "Sami" Singh (Sami-s.dev), Full-Stack Developer & Software Engineer.
           Site: https://sami-s.dev
@@ -121,8 +194,8 @@ jobs:
           This notice does not replace or modify any license or notice in the backed-up repository.
           NOTICE
 
-          bundle_digest="$(sha256sum "$package_dir/repository.bundle" | awk '{print $1}')"
-          {
+            bundle_digest="$(sha256sum "$package_dir/repository.bundle" | awk '{print $1}')"
+            {
             echo "FERROWORKS encrypted Git backup"
             echo "copyright=Copyright © 2025 FERROWORKS."
             echo "project_lead=Samrath Sami Singh (Sami-s.dev)"
@@ -137,18 +210,19 @@ jobs:
             echo "contents=Git refs and HEAD"
             echo "limitations=Does not include uncommitted files, untracked files, or Git LFS payload objects."
             echo "envelope=FWENC003; per-recipient RSA-OAEP-SHA256 key wrapping; AES-256-CBC; HMAC-SHA256"
-          } > "$package_dir/MANIFEST.txt"
+            } > "$package_dir/MANIFEST.txt"
 
-          (
-            cd "$package_dir"
-            sha256sum COPYRIGHT.txt MANIFEST.txt repository.bundle > package.sha256
-            sha256sum --check package.sha256
-          )
+            (
+              cd "$package_dir"
+              sha256sum COPYRIGHT.txt MANIFEST.txt repository.bundle > package.sha256
+              sha256sum --check package.sha256
+            )
 
-          tar --create --file="$payload" --directory="$package_dir" \
-            --sort=name --mtime='UTC 1970-01-01' \
-            --owner=0 --group=0 --numeric-owner --format=posix .
-          tar --list --file="$payload" >/dev/null
+            tar --create --file="$payload" --directory="$package_dir" \
+              --sort=name --mtime='UTC 1970-01-01' \
+              --owner=0 --group=0 --numeric-owner --format=posix .
+            tar --list --file="$payload" >/dev/null
+          fi
 
           helper="$work_dir/ferroworks_hybrid_encrypt.py"
           cat > "$helper" <<'PYHELPER'
@@ -296,21 +370,30 @@ jobs:
                       temp_output.unlink(missing_ok=True)
                   shutil.rmtree(work, ignore_errors=True)
 
-          def decrypt(source, private_key, output):
+          def decrypt(source, private_key, output=None, passphrase_file=None, verify_only=False):
               openssl_path = openssl()
-              source, private_key, output = source.resolve(), private_key.resolve(), output.resolve()
+              source, private_key = source.resolve(), private_key.resolve()
               if not source.is_file() or not private_key.is_file():
                   raise Failure("Encrypted input or private key does not exist.")
-              if output.exists():
-                  raise Failure("Output already exists: " + str(output))
-              output.parent.mkdir(parents=True, exist_ok=True)
+              if output is None and not verify_only:
+                  raise Failure("A plaintext output path is required for decryption.")
+              if output is not None:
+                  output = output.resolve()
+                  if output.exists():
+                      raise Failure("Output already exists: " + str(output))
+                  output.parent.mkdir(parents=True, exist_ok=True)
               work = Path(tempfile.mkdtemp(prefix="fwdec-"))
               os.chmod(work, 0o700)
               temp_output = None
               try:
-                  import getpass
                   size = source.stat().st_size
-                  passphrase = getpass.getpass("Private key passphrase: ")
+                  if passphrase_file is None:
+                      import getpass
+                      passphrase = getpass.getpass("Private key passphrase: ")
+                  else:
+                      passphrase = Path(passphrase_file).read_text(encoding="utf-8")
+                      if passphrase.endswith("\n"):
+                          passphrase = passphrase[:-1]
                   if "\n" in passphrase or "\r" in passphrase or "\x00" in passphrase:
                       raise Failure("Private-key passphrase contains an unsupported character.")
                   passfile = work / "private-key.pass"
@@ -388,6 +471,9 @@ jobs:
                           mac.update(block)
                   if not hmac.compare_digest(mac.digest(), tag):
                       raise Failure("Authentication failed: damaged backup or wrong private key.")
+                  if verify_only:
+                      print("FWENC003 integrity check passed; no plaintext was written.")
+                      return
                   passfile = work / "passphrase.txt"
                   passfile.write_text(master.hex() + "\n", encoding="ascii")
                   payload = work / "decrypted.tar"
@@ -416,14 +502,20 @@ jobs:
               enc.add_argument("--output", type=Path, required=True)
               dec = sub.add_parser("decrypt")
               dec.add_argument("--private-key", type=Path, required=True)
+              dec.add_argument("--passphrase-file", type=Path)
               dec.add_argument("--input", type=Path, required=True)
-              dec.add_argument("--output", type=Path, required=True)
+              dec.add_argument("--output", type=Path)
+              dec.add_argument("--verify-only", action="store_true")
               args = parser.parse_args()
               try:
                   if args.mode == "encrypt":
                       encrypt(args.input, args.public_key, args.output)
                   else:
-                      decrypt(args.input, args.private_key, args.output)
+                      if args.verify_only and args.output is not None:
+                          raise Failure("--output cannot be used with --verify-only.")
+                      if not args.verify_only and args.output is None:
+                          raise Failure("--output is required unless --verify-only is used.")
+                      decrypt(args.input, args.private_key, args.output, args.passphrase_file, args.verify_only)
               except (Failure, OSError) as exc:
                   print("error: " + str(exc), file=sys.stderr)
                   raise SystemExit(1)
@@ -434,38 +526,134 @@ jobs:
           PYHELPER
           chmod 0700 "$helper"
 
-          python3 "$helper" encrypt \
-            --input "$payload" \
-            --output "$encrypted" \
-            "${recipient_args[@]}" | tee "$work_dir/encryption-report.txt"
-
-          {
-            echo "### Encrypted Git backup"
-            echo "- Branch/ref: $GITHUB_REF"
-            echo "- Commit: $GITHUB_SHA"
-            echo "- Triggered by: $GITHUB_ACTOR"
-            echo "- Recipient keys configured: ${#recipient_keys[@]}"
-            grep '^Recipient key fingerprints:' "$work_dir/encryption-report.txt"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          (
-            cd "$artifact_dir"
-            sha256sum "$(basename "$encrypted")" > "$(basename "$encrypted").sha256"
-            sha256sum --check "$(basename "$encrypted").sha256"
+          if [[ "$operation" == "encrypt-file" || "$operation" == "decrypt-file" || "$operation" == "verify-file" ]]; then
+            if [[ -z "$file_path" || "$file_path" == *$'\n'* || "$file_path" == *$'\r'* ]]; then
+              echo "::error::Enter one repository-relative tracked file path."
+              exit 1
+            fi
+            python3 - "$file_path" <<'PYVALIDATE'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path, PurePosixPath
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          raw = sys.argv[1]
+          rel = PurePosixPath(raw)
+          if rel.is_absolute() or not rel.parts or any(part in ("", ".", "..", ".git") for part in rel.parts):
+              raise SystemExit("Unsafe file path; use a tracked repository-relative path outside .git.")
+          if rel.parts[:2] in ((".github", "workflows"), (".github", "backup-recipients")):
+              raise SystemExit("Workflow files and recipient public-key files cannot be transformed.")
+          current = root
+          for part in rel.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit("Symbolic-link paths are not accepted.")
+          if not current.is_file():
+              raise SystemExit("The selected path must be an existing regular file.")
+          normalized = current.relative_to(root).as_posix()
+          result = subprocess.run(
+              ["git", "ls-files", "--error-unmatch", "--", ":(literal)" + normalized],
+              cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
           )
+          if result.returncode:
+              raise SystemExit("The selected file must already be tracked by Git.")
+          PYVALIDATE
+            target="$GITHUB_WORKSPACE/$file_path"
+            original_mode="$(stat -c '%a' -- "$target")"
+            selected_output="$work_dir/selected-file.result"
+            if [[ "$operation" == "encrypt-file" ]]; then
+              if python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read(8) == b"FWENC003" else 1)' "$target"; then
+                echo "::error::The selected file is already in FWENC003 format."
+                exit 1
+              fi
+              python3 "$helper" encrypt --input "$target" --output "$selected_output" "${recipient_args[@]}" \
+                | tee "$work_dir/file-operation-report.txt"
+            else
+              if [[ -z "${BACKUP_DECRYPT_PRIVATE_KEY:-}" ]]; then
+                echo "::error title=Private key missing::Add BACKUP_DECRYPT_PRIVATE_KEY as a repository secret; private keys cannot be entered as dispatch inputs."
+                exit 1
+              fi
+              if ! python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read(8) == b"FWENC003" else 1)' "$target"; then
+                echo "::error::The selected file is not an FWENC003 encrypted file."
+                exit 1
+              fi
+              private_key="$work_dir/decrypt-private.pem"
+              passphrase_file="$work_dir/decrypt-passphrase.txt"
+              printf '%s' "$BACKUP_DECRYPT_PRIVATE_KEY" > "$private_key"
+              printf '%s\n' "${BACKUP_DECRYPT_PASSPHRASE:-}" > "$passphrase_file"
+              chmod 0600 "$private_key" "$passphrase_file"
+              if [[ "$operation" == "verify-file" ]]; then
+                python3 "$helper" decrypt \
+                  --private-key "$private_key" \
+                  --passphrase-file "$passphrase_file" \
+                  --input "$target" \
+                  --verify-only
+                {
+                  echo "### FERROWORKS / Integrity verification"
+                  echo "- Result: FWENC003 authentication tag verified"
+                  echo "- File: $file_path"
+                  echo "- Branch: $GITHUB_REF_NAME"
+                  echo "- File changed: no"
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "Verified $file_path without writing plaintext or changing the branch."
+                exit 0
+              fi
+              python3 "$helper" decrypt \
+                --private-key "$private_key" \
+                --passphrase-file "$passphrase_file" \
+                --input "$target" \
+                --output "$selected_output"
+            fi
+            chmod --reference="$target" "$selected_output"
+            mv -- "$selected_output" "$target"
+            selected_output=""
+            git add -- ":(literal)$file_path"
+            commit_message="[$operation] $file_path [skip ci]"
+            {
+              echo "### FERROWORKS / File operation"
+              echo "- Operation: $operation"
+              echo "- File: $file_path"
+              echo "- Branch: $GITHUB_REF_NAME"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$operation" == "encrypt-file" ]]; then
+              append_ciphertext_preview "$target"
+            fi
+          else
+            python3 "$helper" encrypt \
+              --input "$payload" \
+              --output "$encrypted" \
+              "${recipient_args[@]}" | tee "$work_dir/encryption-report.txt"
 
-          backup_dir="$GITHUB_WORKSPACE/.github/encrypted-backups"
-          mkdir -p "$backup_dir"
-          cp -- "$encrypted" "$backup_dir/"
-          cp -- "$encrypted.sha256" "$backup_dir/"
+            {
+              echo "### Encrypted Git backup"
+              echo "- Branch/ref: $GITHUB_REF"
+              echo "- Commit: $GITHUB_SHA"
+              echo "- Triggered by: $GITHUB_ACTOR"
+              echo "- Recipient keys configured: ${#recipient_keys[@]}"
+              grep '^Recipient key fingerprints:' "$work_dir/encryption-report.txt"
+            } >> "$GITHUB_STEP_SUMMARY"
+            append_ciphertext_preview "$encrypted"
+
+            (
+              cd "$artifact_dir"
+              sha256sum "$(basename "$encrypted")" > "$(basename "$encrypted").sha256"
+              sha256sum --check "$(basename "$encrypted").sha256"
+            )
+
+            backup_dir="$GITHUB_WORKSPACE/.github/encrypted-backups"
+            mkdir -p "$backup_dir"
+            cp -- "$encrypted" "$backup_dir/"
+            cp -- "$encrypted.sha256" "$backup_dir/"
+            git add -- ".github/encrypted-backups/$(basename "$encrypted")" ".github/encrypted-backups/$(basename "$encrypted").sha256"
+            commit_message="[encrypted-backup] ${GITHUB_REF_NAME} ${GITHUB_SHA} [skip ci]"
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- ".github/encrypted-backups/$(basename "$encrypted")" ".github/encrypted-backups/$(basename "$encrypted").sha256"
-          git commit -m "[encrypted-backup] ${GITHUB_REF_NAME} ${GITHUB_SHA} [skip ci]"
+          git commit -m "$commit_message"
           git push origin "HEAD:${GITHUB_REF}"
-          echo "Encrypted backup committed to ${GITHUB_REF} at .github/encrypted-backups/."
+          echo "Committed ${operation} output to ${GITHUB_REF}."
 
           rm -rf -- "$work_dir"
           rm -rf -- "$artifact_dir"
-          rm -f -- "$public_key"
-
+          rm -f -- "$configured_public_key" "$dispatch_public_key"
