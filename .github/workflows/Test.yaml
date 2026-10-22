@@ -1,4 +1,4 @@
-# FERROWORKS encrypted Git recovery workflow.
+ FERROWORKS encrypted Git recovery workflow.
 # Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
 # This workflow intentionally has no pull_request trigger.
 # Manual dispatch encrypts the exact commit SHA for the branch/ref selected in
@@ -9,10 +9,17 @@
 # 2. Generate an RSA key pair offline:
 #      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out backup-private.pem
 #      openssl pkey -in backup-private.pem -pubout -out backup-public.pem
-# 3. Save the contents of backup-public.pem as the repository variable
-#    BACKUP_RECIPIENT_PUBLIC_KEY. A repository secret with the same name also
-#    works. Environment-scoped values require adding that named environment to
-#    the job. Never add the private key to GitHub.
+# 3. Add one public PEM per teammate under .github/backup-recipients/*.pem.
+#    Public keys may be committed; never add private keys to GitHub.
+#    The BACKUP_RECIPIENT_PUBLIC_KEY repository variable/secret remains
+#    supported as an additional recipient for compatibility.
+# 4. Protect changes to .github/backup-recipients with branch protection and
+#    required review. Removing a key affects future backups only; it cannot
+#    revoke artifacts already downloaded or encrypted for that key.
+# 5. This design commits ciphertext to the source branch as requested. Later
+#    full-history bundles therefore contain earlier encrypted-backup commits.
+#    The workflow requires GitHub Actions to have contents:write permission;
+#    protected branches may require a pull-request-based publishing strategy.
 #
 # OFFLINE RESTORE:
 # Save this YAML file separately. Extract its embedded helper with:
@@ -28,7 +35,9 @@
 #   git clone restore-files/repository.bundle restored-repository
 #
 # Envelope: RSA-OAEP-SHA256 key wrap + AES-256-CBC + HMAC-SHA256.
-# The workflow uses GitHub's official checkout and artifact services, but no
+# The recipient list has no configured count cap; practical runner and artifact
+# storage limits still apply.
+# The workflow uses GitHub's official checkout and branch write permission, but no
 # OpenPGP, third-party encryption API, secret-scanning service, or attestation.
 
 name: FERROWORKS encrypted recovery
@@ -40,14 +49,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   encrypted-backup:
-    name: Create and upload encrypted Git backup
+    name: Encrypt selected commit and commit backup
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/')) ||
         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       }}
     runs-on: ubuntu-24.04
@@ -58,7 +67,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Build and encrypt backup
         shell: bash
@@ -68,24 +77,35 @@ jobs:
           set -euo pipefail
           umask 077
 
-          if [[ -z "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
-            echo "::error title=Recipient key unavailable::Set BACKUP_RECIPIENT_PUBLIC_KEY as a repository variable or repository secret in this same repository. Environment-scoped values require the matching job environment."
-            exit 1
-          fi
-
           work_dir="$RUNNER_TEMP/ferroworks-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           artifact_dir="$RUNNER_TEMP/ferroworks-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           public_key="$RUNNER_TEMP/ferroworks-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
           mkdir -m 0700 "$work_dir" "$artifact_dir"
-          trap 'rm -rf -- "$work_dir"; rm -f -- "$public_key"' EXIT
+          trap 'rm -rf -- "$work_dir" "$artifact_dir"; rm -f -- "$public_key"' EXIT
 
-          printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$public_key"
-          chmod 0600 "$public_key"
+          recipient_keys=()
+          recipient_args=()
+          shopt -s nullglob
+          for key in "$GITHUB_WORKSPACE"/.github/backup-recipients/*.pem; do
+            recipient_keys+=("$key")
+          done
+          if [[ -n "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
+            printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$public_key"
+            chmod 0600 "$public_key"
+            recipient_keys+=("$public_key")
+          fi
+          if (( ${#recipient_keys[@]} == 0 )); then
+            echo "::error title=Recipients not configured::Add PEM RSA public keys under .github/backup-recipients/ or set BACKUP_RECIPIENT_PUBLIC_KEY."
+            exit 1
+          fi
+          for key in "${recipient_keys[@]}"; do
+            recipient_args+=(--public-key "$key")
+          done
 
           bundle="$work_dir/repository.bundle"
           package_dir="$work_dir/package"
           payload="$work_dir/ferroworks-${GITHUB_SHA}.backup.tar"
-          encrypted="$artifact_dir/ferroworks-${GITHUB_SHA}.backup.fwenc"
+          encrypted="$artifact_dir/ferroworks-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.backup.fwenc"
           mkdir -m 0700 "$package_dir"
 
           git bundle create "$bundle" --all HEAD
@@ -110,11 +130,13 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "trigger=$GITHUB_EVENT_NAME"
+            echo "actor=$GITHUB_ACTOR"
+            echo "recipient_key_count=${#recipient_keys[@]}"
             echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "git_bundle_sha256=$bundle_digest"
             echo "contents=Git refs and HEAD"
             echo "limitations=Does not include uncommitted files, untracked files, or Git LFS payload objects."
-            echo "envelope=FWENC001; RSA-OAEP-SHA256 key wrapping; AES-256-CBC; HMAC-SHA256"
+            echo "envelope=FWENC003; per-recipient RSA-OAEP-SHA256 key wrapping; AES-256-CBC; HMAC-SHA256"
           } > "$package_dir/MANIFEST.txt"
 
           (
@@ -144,13 +166,14 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          MAGIC = b"FWENC001"
-          VERSION = 1
+          MAGIC = b"FWENC003"
+          VERSION = 3
           ITERATIONS = 600_000
           SALT_BYTES = 16
           MASTER_BYTES = 64
           TAG_BYTES = 32
-          HEADER = struct.Struct(">8sBI16sH")
+          HEADER = struct.Struct(">8sBI16sQ")
+          RECIPIENT_ID_BYTES = 32
           MAC_LABEL = b"FERROWORKS-FWENC-MAC-v1"
 
           class Failure(Exception):
@@ -170,6 +193,22 @@ jobs:
               if result.returncode:
                   detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
                   raise Failure(message + (": " + detail[-1] if detail else ""))
+
+          def public_key_id(openssl_path, public_key):
+              key_info = subprocess.run(
+                  [openssl_path, "rsa", "-pubin", "-in", str(public_key), "-noout", "-text"],
+                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+              )
+              match = re.search(r"Public-Key:\s*\((\d+)\s+bit\)", key_info.stdout)
+              if key_info.returncode or not match or int(match.group(1)) < 2048:
+                  raise Failure("Every recipient must be a PEM RSA public key of at least 2048 bits.")
+              result = subprocess.run(
+                  [openssl_path, "pkey", "-pubin", "-in", str(public_key), "-pubout", "-outform", "DER"],
+                  stdin=subprocess.DEVNULL, capture_output=True,
+              )
+              if result.returncode or not result.stdout:
+                  raise Failure("Could not fingerprint a recipient public key.")
+              return hashlib.sha256(result.stdout).digest()
 
           def mac_key(master):
               return hmac.new(master, MAC_LABEL, hashlib.sha256).digest()
@@ -191,19 +230,22 @@ jobs:
                   raise Failure("Output already exists: " + str(output))
               temp_path.unlink()
 
-          def encrypt(source, public_key, output):
+          def encrypt(source, public_keys, output):
               openssl_path = openssl()
-              source, public_key, output = source.resolve(), public_key.resolve(), output.resolve()
-              if not source.is_file() or not public_key.is_file():
-                  raise Failure("Input file or public key does not exist.")
+              source, output = source.resolve(), output.resolve()
+              public_keys = [path.resolve() for path in public_keys]
+              if not source.is_file() or not public_keys or any(not path.is_file() for path in public_keys):
+                  raise Failure("Input file or recipient public key does not exist.")
               output.parent.mkdir(parents=True, exist_ok=True)
-              key_info = subprocess.run(
-                  [openssl_path, "rsa", "-pubin", "-in", str(public_key), "-noout", "-text"],
-                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
-              )
-              match = re.search(r"Public-Key:\s*\((\d+)\s+bit\)", key_info.stdout)
-              if key_info.returncode or not match or int(match.group(1)) < 2048:
-                  raise Failure("Use a PEM RSA public key of at least 2048 bits.")
+              recipients = []
+              seen_ids = set()
+              for public_key in public_keys:
+                  recipient_id = public_key_id(openssl_path, public_key)
+                  if recipient_id not in seen_ids:
+                      recipients.append((recipient_id, public_key))
+                      seen_ids.add(recipient_id)
+              if not recipients:
+                  raise Failure("At least one distinct recipient key is required.")
               work = Path(tempfile.mkdtemp(prefix="fwenc-"))
               os.chmod(work, 0o700)
               temp_output = None
@@ -212,17 +254,20 @@ jobs:
                   key_file = work / "master.key"
                   key_file.write_bytes(master)
                   os.chmod(key_file, 0o600)
-                  wrapped_file = work / "wrapped.key"
-                  checked([
-                      openssl_path, "pkeyutl", "-encrypt", "-pubin", "-inkey", str(public_key),
-                      "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
-                      "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(key_file), "-out", str(wrapped_file),
-                  ], "RSA-OAEP key wrapping failed")
-                  wrapped = wrapped_file.read_bytes()
-                  if not wrapped or len(wrapped) > 65535:
-                      raise Failure("Invalid wrapped-key size.")
+                  records = []
+                  for index, (recipient_id, public_key) in enumerate(recipients):
+                      wrapped_file = work / ("wrapped-" + str(index) + ".key")
+                      checked([
+                          openssl_path, "pkeyutl", "-encrypt", "-pubin", "-inkey", str(public_key),
+                          "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
+                          "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(key_file), "-out", str(wrapped_file),
+                      ], "RSA-OAEP key wrapping failed")
+                      wrapped = wrapped_file.read_bytes()
+                      if not wrapped or len(wrapped) > 65535:
+                          raise Failure("Invalid wrapped-key size.")
+                      records.append(recipient_id + struct.pack(">H", len(wrapped)) + wrapped)
                   salt = os.urandom(SALT_BYTES)
-                  header = HEADER.pack(MAGIC, VERSION, ITERATIONS, salt, len(wrapped)) + wrapped
+                  header = HEADER.pack(MAGIC, VERSION, ITERATIONS, salt, len(records)) + b"".join(records)
                   passfile = work / "passphrase.txt"
                   passfile.write_text(master.hex() + "\n", encoding="ascii")
                   os.chmod(passfile, 0o600)
@@ -244,6 +289,7 @@ jobs:
                       os.fsync(out.fileno())
                   publish(temp_output, output)
                   temp_output = None
+                  print("Recipient key fingerprints: " + ", ".join(rid.hex() for rid, _ in recipients))
                   print(output)
               finally:
                   if temp_output:
@@ -262,18 +308,50 @@ jobs:
               os.chmod(work, 0o700)
               temp_output = None
               try:
+                  import getpass
                   size = source.stat().st_size
+                  passphrase = getpass.getpass("Private key passphrase: ")
+                  if "\n" in passphrase or "\r" in passphrase or "\x00" in passphrase:
+                      raise Failure("Private-key passphrase contains an unsupported character.")
+                  passfile = work / "private-key.pass"
+                  passfile.write_text(passphrase + "\n", encoding="utf-8")
+                  os.chmod(passfile, 0o600)
+                  private_der = subprocess.run(
+                      [openssl_path, "pkey", "-in", str(private_key), "-pubout", "-outform", "DER",
+                       "-passin", "file:" + str(passfile)],
+                      stdin=subprocess.DEVNULL, capture_output=True,
+                  )
+                  if private_der.returncode or not private_der.stdout:
+                      raise Failure("Could not read the private key or its passphrase.")
+                  recipient_id = hashlib.sha256(private_der.stdout).digest()
                   with source.open("rb") as stream:
                       prefix = stream.read(HEADER.size)
                       if len(prefix) != HEADER.size:
                           raise Failure("Invalid FWENC file.")
-                      magic, version, iterations, salt, wrapped_len = HEADER.unpack(prefix)
-                      if magic != MAGIC or version != VERSION or iterations != ITERATIONS or wrapped_len < 256:
+                      magic, version, iterations, salt, recipient_count = HEADER.unpack(prefix)
+                      max_recipient_count = (size - HEADER.size - TAG_BYTES) // (RECIPIENT_ID_BYTES + 2 + 256)
+                      if (magic != MAGIC or version != VERSION or iterations != ITERATIONS
+                              or recipient_count < 1 or recipient_count > max_recipient_count):
                           raise Failure("Unsupported or invalid FWENC format.")
-                      wrapped = stream.read(wrapped_len)
-                      if len(wrapped) != wrapped_len:
-                          raise Failure("Truncated wrapped key.")
-                      header = prefix + wrapped
+                      records = []
+                      record_bytes = bytearray()
+                      for _ in range(recipient_count):
+                          rid = stream.read(RECIPIENT_ID_BYTES)
+                          wrapped_length_bytes = stream.read(2)
+                          if len(rid) != RECIPIENT_ID_BYTES or len(wrapped_length_bytes) != 2:
+                              raise Failure("Truncated recipient list.")
+                          wrapped_len = struct.unpack(">H", wrapped_length_bytes)[0]
+                          if wrapped_len < 256:
+                              raise Failure("Invalid wrapped-key length.")
+                          wrapped = stream.read(wrapped_len)
+                          if len(wrapped) != wrapped_len:
+                              raise Failure("Truncated wrapped key.")
+                          record_bytes.extend(rid + wrapped_length_bytes + wrapped)
+                          records.append((rid, wrapped))
+                      header = prefix + bytes(record_bytes)
+                      wrapped = next((blob for rid, blob in records if rid == recipient_id), None)
+                      if wrapped is None:
+                          raise Failure("This private key is not an authorized backup recipient.")
                       cipher_len = size - len(header) - TAG_BYTES
                       if cipher_len < 16 or cipher_len % 16:
                           raise Failure("Invalid or truncated ciphertext.")
@@ -292,11 +370,11 @@ jobs:
                   wrapped_file = work / "wrapped.key"
                   wrapped_file.write_bytes(wrapped)
                   key_file = work / "master.key"
-                  # An encrypted offline private key may prompt for its passphrase here.
                   result = subprocess.run([
                       openssl_path, "pkeyutl", "-decrypt", "-inkey", str(private_key),
                       "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
-                      "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(wrapped_file), "-out", str(key_file),
+                      "-pkeyopt", "rsa_mgf1_md:sha256", "-passin", "file:" + str(passfile),
+                      "-in", str(wrapped_file), "-out", str(key_file),
                   ])
                   if result.returncode or not key_file.is_file():
                       raise Failure("Could not unwrap the backup key.")
@@ -333,7 +411,7 @@ jobs:
               parser = argparse.ArgumentParser()
               sub = parser.add_subparsers(dest="mode", required=True)
               enc = sub.add_parser("encrypt")
-              enc.add_argument("--public-key", type=Path, required=True)
+              enc.add_argument("--public-key", type=Path, action="append", required=True)
               enc.add_argument("--input", type=Path, required=True)
               enc.add_argument("--output", type=Path, required=True)
               dec = sub.add_parser("decrypt")
@@ -357,9 +435,18 @@ jobs:
           chmod 0700 "$helper"
 
           python3 "$helper" encrypt \
-            --public-key "$public_key" \
             --input "$payload" \
-            --output "$encrypted"
+            --output "$encrypted" \
+            "${recipient_args[@]}" | tee "$work_dir/encryption-report.txt"
+
+          {
+            echo "### Encrypted Git backup"
+            echo "- Branch/ref: $GITHUB_REF"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Triggered by: $GITHUB_ACTOR"
+            echo "- Recipient keys configured: ${#recipient_keys[@]}"
+            grep '^Recipient key fingerprints:' "$work_dir/encryption-report.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           (
             cd "$artifact_dir"
@@ -367,15 +454,18 @@ jobs:
             sha256sum --check "$(basename "$encrypted").sha256"
           )
 
-          # Plaintext package and Git bundle are removed before the artifact step.
+          backup_dir="$GITHUB_WORKSPACE/.github/encrypted-backups"
+          mkdir -p "$backup_dir"
+          cp -- "$encrypted" "$backup_dir/"
+          cp -- "$encrypted.sha256" "$backup_dir/"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- ".github/encrypted-backups/$(basename "$encrypted")" ".github/encrypted-backups/$(basename "$encrypted").sha256"
+          git commit -m "[encrypted-backup] ${GITHUB_REF_NAME} ${GITHUB_SHA} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF}"
+          echo "Encrypted backup committed to ${GITHUB_REF} at .github/encrypted-backups/."
+
           rm -rf -- "$work_dir"
+          rm -rf -- "$artifact_dir"
           rm -f -- "$public_key"
 
-      - name: Upload encrypted backup
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ferroworks-encrypted-${{ github.sha }}
-          path: ${{ runner.temp }}/ferroworks-artifact-${{ github.run_id }}-${{ github.run_attempt }}/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
