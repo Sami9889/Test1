@@ -1,659 +1,446 @@
-# FERROWORKS encrypted Git recovery workflow. 
-# Copyright © 2025 FERROWORKS. Project lead: Samrath "Sami" Singh.
-# This workflow intentionally has no pull_request trigger.
-# Manual dispatch can create a Git backup or encrypt/decrypt one tracked file
-# in place on the selected branch. Push and scheduled runs back up the default branch.
-#
-# ONE-FILE SETUP:
-# 1. Add this YAML file at .github/workflows/ferroworks-encrypted-recovery.yml.
-# 2. Generate an RSA key pair offline:
-#      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out backup-private.pem
-#      openssl pkey -in backup-private.pem -pubout -out backup-public.pem
-# 3. Add one public PEM per teammate under .github/backup-recipients/*.pem,
-#    or paste a recipient public PEM into the manual-dispatch input.
-#    Public keys may be committed; never add private keys to Git or dispatch inputs.
-#    The BACKUP_RECIPIENT_PUBLIC_KEY repository variable/secret remains supported.
-# 4. Protect changes to .github/backup-recipients with branch protection and
-#    required review. Removing a key affects future backups only; it cannot
-#    revoke encrypted backups already committed or downloaded.
-# 5. This design commits ciphertext to the source branch as requested. Later
-#    full-history bundles therefore contain earlier encrypted-backup commits.
-#    The workflow requires GitHub Actions to have contents:write permission;
-#    protected branches may require a pull-request-based publishing strategy.
-# 6. Manual encrypt-file/decrypt-file replaces the selected tracked file in
-#    place and commits it. Encryption does not erase plaintext from old Git
-#    history; decrypt-file commits plaintext to the selected branch.
-# 7. For decrypt-file/verify-file, add BACKUP_DECRYPT_PRIVATE_KEY and, when
-#    passphrase-protected, BACKUP_DECRYPT_PASSPHRASE as repository secrets.
-#    Private keys and passphrases are never accepted as dispatch inputs.
-# 8. In Run workflow, choose an operation and enter the tracked repository-relative
-#    file_path. encrypt-file/decrypt-file replace and commit the file; verify-file
-#    checks its authentication tag without changing or committing it.
-#
-# OFFLINE RESTORE:
-# Save this YAML file separately. Extract its embedded helper with:
-#   awk '/^          # BEGIN_HYBRID_HELPER$/{inside=1;next} /^          # END_HYBRID_HELPER$/{inside=0;exit} inside{sub(/^          /,"");print}' \
-#     .github/workflows/ferroworks-encrypted-recovery.yml > ferroworks_hybrid_encrypt.py
-# Then verify and decrypt the committed backup file:
-#   sha256sum --check ferroworks-<commit>-<run>-<attempt>.backup.fwenc.sha256
-#   python3 ferroworks_hybrid_encrypt.py decrypt --private-key backup-private.pem \
-#     --input ferroworks-<commit>.backup.fwenc --output ferroworks-backup.tar
-#   mkdir restore-files
-#   tar -xf ferroworks-backup.tar -C restore-files
-#   (cd restore-files && sha256sum --check package.sha256)
-#   git clone restore-files/repository.bundle restored-repository
-#
-# Envelope: RSA-OAEP-SHA256 key wrap + AES-256-CBC + HMAC-SHA256.
-# The recipient list has no configured count cap; practical runner and Git
-# repository limits still apply.
-# The workflow uses GitHub's official checkout and branch write permission, but no
-# OpenPGP, third-party encryption API, secret-scanning service, or attestation.
-
-name: FERROWORKS encrypted recovery
+# Copyright © 2025 FERROWORKS.
+# Do not remove or alter this notice. Unauthorized tampering may violate applicable law or license terms.
+name: FERROWORKS Pages decrypt and deploy
 
 on:
-  push:
-  schedule:
-    - cron: "0 4 * * *"
+  workflow_run:
+    workflows:
+      - FERROWORKS encrypted recovery
+    types:
+      - completed
   workflow_dispatch:
-    inputs:
-      operation:
-        description: "Back up, encrypt/decrypt a tracked file, or verify an encrypted file"
-        required: true
-        type: choice
-        default: git-backup
-        options:
-          - git-backup
-          - encrypt-file
-          - decrypt-file
-          - verify-file
-      file_path:
-        description: "Repository-relative tracked file path for encrypt/decrypt/verify"
-        required: false
-        type: string
-      recipient_public_key:
-        description: "Optional PEM RSA public key for this run only; never paste a private key"
-        required: false
-        type: string
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ferroworks-pages
+  cancel-in-progress: true
 
 jobs:
-  encrypted-backup:
-    name: Back up repository or encrypt/decrypt one file
+  deploy:
+    name: Decrypt, build, deploy, then encrypt source
     if: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/')) ||
-        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        (github.event_name == 'workflow_dispatch' &&
+         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == github.event.repository.default_branch)
       }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Check out full repository history
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.repository.default_branch || github.ref }}
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Encrypt, decrypt, or back up
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.1
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - name: Calculate the Vite base path
+        id: pages-path
+        shell: bash
+        run: |
+          repository="${GITHUB_REPOSITORY#*/}"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          if [[ "${repository,,}" == "${owner,,}.github.io" ]]; then
+            base_path="/"
+          else
+            base_path="/${repository}/"
+          fi
+          echo "base_path=$base_path" >> "$GITHUB_OUTPUT"
+
+      - name: Make a temporary build copy and decrypt encrypted app files
         shell: bash
         env:
-          OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'git-backup' }}
-          FILE_PATH: ${{ inputs.file_path }}
-          DISPATCH_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
-          BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
           BACKUP_DECRYPT_PRIVATE_KEY: ${{ secrets.BACKUP_DECRYPT_PRIVATE_KEY }}
           BACKUP_DECRYPT_PASSPHRASE: ${{ secrets.BACKUP_DECRYPT_PASSPHRASE }}
         run: |
           set -euo pipefail
-          umask 077
-          operation="${OPERATION:-git-backup}"
-          file_path="${FILE_PATH:-}"
-          case "$operation" in
-            git-backup|encrypt-file|decrypt-file|verify-file) ;;
-            *) echo "::error::Unsupported operation."; exit 1 ;;
-          esac
+          helper="$RUNNER_TEMP/ferroworks_hybrid_encrypt.py"
+          source_copy="$RUNNER_TEMP/ferroworks-pages-source"
 
-          work_dir="$RUNNER_TEMP/ferroworks-work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          artifact_dir="$RUNNER_TEMP/ferroworks-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          configured_public_key="$RUNNER_TEMP/ferroworks-configured-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
-          dispatch_public_key="$RUNNER_TEMP/ferroworks-dispatch-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pem"
-          selected_output=""
-          mkdir -m 0700 "$work_dir" "$artifact_dir"
-          trap 'rm -rf -- "$work_dir" "$artifact_dir"; rm -f -- "$configured_public_key" "$dispatch_public_key"; if [[ -n "$selected_output" ]]; then rm -f -- "$selected_output"; fi' EXIT
+          awk '/^          # BEGIN_HYBRID_HELPER$/{inside=1;next} /^          # END_HYBRID_HELPER$/{inside=0;exit} inside{sub(/^          /,"");print}' \
+            .github/workflows/ferroworks-encrypted-recovery.yml > "$helper"
+          chmod 0700 "$helper"
 
-          append_ciphertext_preview() {
-            local encrypted_path="$1"
-            python3 - "$encrypted_path" <<'PYCIPHERPREVIEW' | tee -a "$GITHUB_STEP_SUMMARY"
-          from pathlib import Path
-          import sys
+          rm -rf -- "$source_copy"
+          mkdir -m 0700 "$source_copy"
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='**/node_modules/' \
+            --exclude='dist/' \
+            --exclude='**/dist/' \
+            --exclude='.cache/' \
+            --exclude='attached_assets/' \
+            --exclude='.github/encrypted-backups/' \
+            "$GITHUB_WORKSPACE/" "$source_copy/"
 
-          payload = Path(sys.argv[1]).read_bytes()
-          preview = payload[:192]
-          glyphs = "FWK!$%&*+-=?@^_#"
-          encoded = "".join(glyphs[value >> 4] + glyphs[value & 0x0F] for value in preview)
-          width = 81
-          title = " FERROWORKS // FWENC003 / CUSTOM GLYPH STREAM "
-          print()
-          print(f"FWENC003 • {len(payload):,} encrypted bytes • custom glyph preview / first {len(preview):,} bytes")
-          print("```text")
-          print("┌" + title + "─" * (width - len(title) - 2) + "┐")
-          for row, start in enumerate(range(0, len(encoded), 64)):
-              chunk = encoded[start:start + 64]
-              groups = " ".join(chunk[index:index + 8] for index in range(0, len(chunk), 8))
-              print(f"│ {row * 32:04X}  {groups:<71} │")
-          if len(payload) > len(preview):
-              print(f"Preview truncated: {len(payload) - len(preview):,} additional encrypted bytes remain in the file.")
-          print("└" + "─" * (width - 2) + "┘")
-          print("```")
-          PYCIPHERPREVIEW
-          }
+          echo "PAGES_SOURCE_COPY=$source_copy" >> "$GITHUB_ENV"
+          echo "FWENC_HELPER=$helper" >> "$GITHUB_ENV"
 
-          recipient_keys=()
-          recipient_args=()
-          shopt -s nullglob
-          for key in "$GITHUB_WORKSPACE"/.github/backup-recipients/*.pem; do
-            recipient_keys+=("$key")
-          done
-          if [[ -n "${BACKUP_RECIPIENT_PUBLIC_KEY:-}" ]]; then
-            printf '%s\n' "$BACKUP_RECIPIENT_PUBLIC_KEY" > "$configured_public_key"
-            chmod 0600 "$configured_public_key"
-            recipient_keys+=("$configured_public_key")
-          fi
-          if [[ -n "${DISPATCH_RECIPIENT_PUBLIC_KEY:-}" ]]; then
-            printf '%s\n' "$DISPATCH_RECIPIENT_PUBLIC_KEY" > "$dispatch_public_key"
-            chmod 0600 "$dispatch_public_key"
-            recipient_keys+=("$dispatch_public_key")
-          fi
-          if [[ "$operation" == "git-backup" || "$operation" == "encrypt-file" ]] && (( ${#recipient_keys[@]} == 0 )); then
-            echo "::error title=Recipients not configured::Paste a PEM RSA public key into the dispatch input, add keys under .github/backup-recipients/, or set BACKUP_RECIPIENT_PUBLIC_KEY."
-            exit 1
-          fi
-          for key in "${recipient_keys[@]}"; do
-            recipient_args+=(--public-key "$key")
-          done
-
-          bundle="$work_dir/repository.bundle"
-          package_dir="$work_dir/package"
-          payload="$work_dir/ferroworks-${GITHUB_SHA}.backup.tar"
-          encrypted="$artifact_dir/ferroworks-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.backup.fwenc"
-          if [[ "$operation" == "git-backup" ]]; then
-            mkdir -m 0700 "$package_dir"
-            git bundle create "$bundle" --all HEAD
-            git bundle verify "$bundle"
-            cp -- "$bundle" "$package_dir/repository.bundle"
-
-            cat > "$package_dir/COPYRIGHT.txt" <<'NOTICE'
-          Copyright © 2025 FERROWORKS.
-          Project lead: Samrath "Sami" Singh (Sami-s.dev), Full-Stack Developer & Software Engineer.
-          Site: https://sami-s.dev
-          Do not alter, remove, or misrepresent this notice or the integrity manifest.
-          Unauthorized tampering may violate applicable license terms or law.
-          This notice does not replace or modify any license or notice in the backed-up repository.
-          NOTICE
-
-            bundle_digest="$(sha256sum "$package_dir/repository.bundle" | awk '{print $1}')"
-            {
-            echo "FERROWORKS encrypted Git backup"
-            echo "copyright=Copyright © 2025 FERROWORKS."
-            echo "project_lead=Samrath Sami Singh (Sami-s.dev)"
-            echo "branch=$GITHUB_REF_NAME"
-            echo "ref=$GITHUB_REF"
-            echo "commit=$GITHUB_SHA"
-            echo "trigger=$GITHUB_EVENT_NAME"
-            echo "actor=$GITHUB_ACTOR"
-            echo "recipient_key_count=${#recipient_keys[@]}"
-            echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "git_bundle_sha256=$bundle_digest"
-            echo "contents=Git refs and HEAD"
-            echo "limitations=Does not include uncommitted files, untracked files, or Git LFS payload objects."
-            echo "envelope=FWENC003; per-recipient RSA-OAEP-SHA256 key wrapping; AES-256-CBC; HMAC-SHA256"
-            } > "$package_dir/MANIFEST.txt"
-
-            (
-              cd "$package_dir"
-              sha256sum COPYRIGHT.txt MANIFEST.txt repository.bundle > package.sha256
-              sha256sum --check package.sha256
-            )
-
-            tar --create --file="$payload" --directory="$package_dir" \
-              --sort=name --mtime='UTC 1970-01-01' \
-              --owner=0 --group=0 --numeric-owner --format=posix .
-            tar --list --file="$payload" >/dev/null
-          fi
-
-          helper="$work_dir/ferroworks_hybrid_encrypt.py"
-          cat > "$helper" <<'PYHELPER'
-          # BEGIN_HYBRID_HELPER
-          #!/usr/bin/env python3
-          import argparse
-          import hashlib
-          import hmac
+          python3 - "$source_copy" "$helper" <<'PYDECRYPT'
           import os
-          import re
-          import shutil
-          import struct
+          import stat
           import subprocess
           import sys
           import tempfile
           from pathlib import Path
 
-          MAGIC = b"FWENC003"
-          VERSION = 3
-          ITERATIONS = 600_000
-          SALT_BYTES = 16
-          MASTER_BYTES = 64
-          TAG_BYTES = 32
-          HEADER = struct.Struct(">8sBI16sQ")
-          RECIPIENT_ID_BYTES = 32
-          MAC_LABEL = b"FERROWORKS-FWENC-MAC-v1"
+          root = Path(sys.argv[1])
+          helper = Path(sys.argv[2])
+          app = root / "artifacts" / "mockup-sandbox"
+          encrypted_files = []
+          for path in app.rglob("*"):
+              if path.is_file() and not path.is_symlink():
+                  with path.open("rb") as stream:
+                      if stream.read(8) == b"FWENC003":
+                          encrypted_files.append(path)
 
-          class Failure(Exception):
-              pass
+          if not encrypted_files:
+              print("No encrypted mockup app files found; using the checked-out source.")
+              raise SystemExit(0)
 
-          def openssl():
-              path = shutil.which("openssl")
-              if not path:
-                  raise Failure("OpenSSL was not found.")
-              result = subprocess.run([path, "version"], capture_output=True, text=True)
-              if result.returncode or not result.stdout.startswith("OpenSSL 3."):
-                  raise Failure("OpenSSL 3.x is required.")
-              return path
-
-          def checked(args, message):
-              result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-              if result.returncode:
-                  detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
-                  raise Failure(message + (": " + detail[-1] if detail else ""))
-
-          def public_key_id(openssl_path, public_key):
-              key_info = subprocess.run(
-                  [openssl_path, "rsa", "-pubin", "-in", str(public_key), "-noout", "-text"],
-                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+          private_key_text = os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", "")
+          if not private_key_text:
+              raise SystemExit(
+                  "Encrypted Pages source exists. Add BACKUP_DECRYPT_PRIVATE_KEY as a repository secret."
               )
-              match = re.search(r"Public-Key:\s*\((\d+)\s+bit\)", key_info.stdout)
-              if key_info.returncode or not match or int(match.group(1)) < 2048:
-                  raise Failure("Every recipient must be a PEM RSA public key of at least 2048 bits.")
-              result = subprocess.run(
-                  [openssl_path, "pkey", "-pubin", "-in", str(public_key), "-pubout", "-outform", "DER"],
-                  stdin=subprocess.DEVNULL, capture_output=True,
-              )
-              if result.returncode or not result.stdout:
-                  raise Failure("Could not fingerprint a recipient public key.")
-              return hashlib.sha256(result.stdout).digest()
 
-          def mac_key(master):
-              return hmac.new(master, MAC_LABEL, hashlib.sha256).digest()
+          work = Path(tempfile.mkdtemp(prefix="fw-pages-decrypt-", dir=os.environ["RUNNER_TEMP"]))
+          os.chmod(work, 0o700)
+          private_key = work / "private.pem"
+          passphrase_file = work / "passphrase.txt"
+          private_key.write_text(private_key_text, encoding="utf-8")
+          passphrase_file.write_text(
+              os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\n") + "\n",
+              encoding="utf-8",
+          )
+          os.chmod(private_key, 0o600)
+          os.chmod(passphrase_file, 0o600)
 
-          def crypt(openssl_path, decrypt, salt, passfile, source, destination):
-              args = [
-                  openssl_path, "enc", "-aes-256-cbc", "-pbkdf2", "-iter", str(ITERATIONS),
-                  "-md", "sha256", "-S", salt.hex(),
-                  "-pass", "file:" + str(passfile), "-in", str(source), "-out", str(destination),
-              ]
-              if decrypt:
-                  args.insert(2, "-d")
-              checked(args, "AES encryption/decryption failed")
-
-          def publish(temp_path, output):
-              try:
-                  os.link(temp_path, output)
-              except FileExistsError:
-                  raise Failure("Output already exists: " + str(output))
-              temp_path.unlink()
-
-          def encrypt(source, public_keys, output):
-              openssl_path = openssl()
-              source, output = source.resolve(), output.resolve()
-              public_keys = [path.resolve() for path in public_keys]
-              if not source.is_file() or not public_keys or any(not path.is_file() for path in public_keys):
-                  raise Failure("Input file or recipient public key does not exist.")
-              output.parent.mkdir(parents=True, exist_ok=True)
-              recipients = []
-              seen_ids = set()
-              for public_key in public_keys:
-                  recipient_id = public_key_id(openssl_path, public_key)
-                  if recipient_id not in seen_ids:
-                      recipients.append((recipient_id, public_key))
-                      seen_ids.add(recipient_id)
-              if not recipients:
-                  raise Failure("At least one distinct recipient key is required.")
-              work = Path(tempfile.mkdtemp(prefix="fwenc-"))
-              os.chmod(work, 0o700)
-              temp_output = None
-              try:
-                  master = os.urandom(MASTER_BYTES)
-                  key_file = work / "master.key"
-                  key_file.write_bytes(master)
-                  os.chmod(key_file, 0o600)
-                  records = []
-                  for index, (recipient_id, public_key) in enumerate(recipients):
-                      wrapped_file = work / ("wrapped-" + str(index) + ".key")
-                      checked([
-                          openssl_path, "pkeyutl", "-encrypt", "-pubin", "-inkey", str(public_key),
-                          "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
-                          "-pkeyopt", "rsa_mgf1_md:sha256", "-in", str(key_file), "-out", str(wrapped_file),
-                      ], "RSA-OAEP key wrapping failed")
-                      wrapped = wrapped_file.read_bytes()
-                      if not wrapped or len(wrapped) > 65535:
-                          raise Failure("Invalid wrapped-key size.")
-                      records.append(recipient_id + struct.pack(">H", len(wrapped)) + wrapped)
-                  salt = os.urandom(SALT_BYTES)
-                  header = HEADER.pack(MAGIC, VERSION, ITERATIONS, salt, len(records)) + b"".join(records)
-                  passfile = work / "passphrase.txt"
-                  passfile.write_text(master.hex() + "\n", encoding="ascii")
-                  os.chmod(passfile, 0o600)
-                  ciphertext = work / "ciphertext.bin"
-                  crypt(openssl_path, False, salt, passfile, source, ciphertext)
-                  mac = hmac.new(mac_key(master), digestmod=hashlib.sha256)
-                  mac.update(header)
-                  with ciphertext.open("rb") as stream:
-                      for block in iter(lambda: stream.read(1024 * 1024), b""):
-                          mac.update(block)
-                  with tempfile.NamedTemporaryFile(prefix=".fwenc-", dir=output.parent, delete=False) as out:
-                      temp_output = Path(out.name)
-                      os.chmod(temp_output, 0o600)
-                      out.write(header)
-                      with ciphertext.open("rb") as stream:
-                          shutil.copyfileobj(stream, out, 1024 * 1024)
-                      out.write(mac.digest())
-                      out.flush()
-                      os.fsync(out.fileno())
-                  publish(temp_output, output)
-                  temp_output = None
-                  print("Recipient key fingerprints: " + ", ".join(rid.hex() for rid, _ in recipients))
-                  print(output)
-              finally:
-                  if temp_output:
-                      temp_output.unlink(missing_ok=True)
-                  shutil.rmtree(work, ignore_errors=True)
-
-          def decrypt(source, private_key, output=None, passphrase_file=None, verify_only=False):
-              openssl_path = openssl()
-              source, private_key = source.resolve(), private_key.resolve()
-              if not source.is_file() or not private_key.is_file():
-                  raise Failure("Encrypted input or private key does not exist.")
-              if output is None and not verify_only:
-                  raise Failure("A plaintext output path is required for decryption.")
-              if output is not None:
-                  output = output.resolve()
-                  if output.exists():
-                      raise Failure("Output already exists: " + str(output))
-                  output.parent.mkdir(parents=True, exist_ok=True)
-              work = Path(tempfile.mkdtemp(prefix="fwdec-"))
-              os.chmod(work, 0o700)
-              temp_output = None
-              try:
-                  size = source.stat().st_size
-                  if passphrase_file is None:
-                      import getpass
-                      passphrase = getpass.getpass("Private key passphrase: ")
-                  else:
-                      passphrase = Path(passphrase_file).read_text(encoding="utf-8")
-                      if passphrase.endswith("\n"):
-                          passphrase = passphrase[:-1]
-                  if "\n" in passphrase or "\r" in passphrase or "\x00" in passphrase:
-                      raise Failure("Private-key passphrase contains an unsupported character.")
-                  passfile = work / "private-key.pass"
-                  passfile.write_text(passphrase + "\n", encoding="utf-8")
-                  os.chmod(passfile, 0o600)
-                  private_der = subprocess.run(
-                      [openssl_path, "pkey", "-in", str(private_key), "-pubout", "-outform", "DER",
-                       "-passin", "file:" + str(passfile)],
-                      stdin=subprocess.DEVNULL, capture_output=True,
+          try:
+              for encrypted in encrypted_files:
+                  fd, temporary_name = tempfile.mkstemp(
+                      prefix=".fwplain-", dir=encrypted.parent
                   )
-                  if private_der.returncode or not private_der.stdout:
-                      raise Failure("Could not read the private key or its passphrase.")
-                  recipient_id = hashlib.sha256(private_der.stdout).digest()
-                  with source.open("rb") as stream:
-                      prefix = stream.read(HEADER.size)
-                      if len(prefix) != HEADER.size:
-                          raise Failure("Invalid FWENC file.")
-                      magic, version, iterations, salt, recipient_count = HEADER.unpack(prefix)
-                      max_recipient_count = (size - HEADER.size - TAG_BYTES) // (RECIPIENT_ID_BYTES + 2 + 256)
-                      if (magic != MAGIC or version != VERSION or iterations != ITERATIONS
-                              or recipient_count < 1 or recipient_count > max_recipient_count):
-                          raise Failure("Unsupported or invalid FWENC format.")
-                      records = []
-                      record_bytes = bytearray()
-                      for _ in range(recipient_count):
-                          rid = stream.read(RECIPIENT_ID_BYTES)
-                          wrapped_length_bytes = stream.read(2)
-                          if len(rid) != RECIPIENT_ID_BYTES or len(wrapped_length_bytes) != 2:
-                              raise Failure("Truncated recipient list.")
-                          wrapped_len = struct.unpack(">H", wrapped_length_bytes)[0]
-                          if wrapped_len < 256:
-                              raise Failure("Invalid wrapped-key length.")
-                          wrapped = stream.read(wrapped_len)
-                          if len(wrapped) != wrapped_len:
-                              raise Failure("Truncated wrapped key.")
-                          record_bytes.extend(rid + wrapped_length_bytes + wrapped)
-                          records.append((rid, wrapped))
-                      header = prefix + bytes(record_bytes)
-                      wrapped = next((blob for rid, blob in records if rid == recipient_id), None)
-                      if wrapped is None:
-                          raise Failure("This private key is not an authorized backup recipient.")
-                      cipher_len = size - len(header) - TAG_BYTES
-                      if cipher_len < 16 or cipher_len % 16:
-                          raise Failure("Invalid or truncated ciphertext.")
-                      cipher = work / "ciphertext.bin"
-                      with cipher.open("xb") as out:
-                          remaining = cipher_len
-                          while remaining:
-                              block = stream.read(min(1024 * 1024, remaining))
-                              if not block:
-                                  raise Failure("Truncated ciphertext.")
-                              out.write(block)
-                              remaining -= len(block)
-                      tag = stream.read(TAG_BYTES)
-                      if len(tag) != TAG_BYTES or stream.read(1):
-                          raise Failure("Invalid authentication tag or trailing data.")
-                  wrapped_file = work / "wrapped.key"
-                  wrapped_file.write_bytes(wrapped)
-                  key_file = work / "master.key"
-                  result = subprocess.run([
-                      openssl_path, "pkeyutl", "-decrypt", "-inkey", str(private_key),
-                      "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha256",
-                      "-pkeyopt", "rsa_mgf1_md:sha256", "-passin", "file:" + str(passfile),
-                      "-in", str(wrapped_file), "-out", str(key_file),
-                  ])
-                  if result.returncode or not key_file.is_file():
-                      raise Failure("Could not unwrap the backup key.")
-                  master = key_file.read_bytes()
-                  if len(master) != MASTER_BYTES:
-                      raise Failure("Invalid unwrapped key.")
-                  mac = hmac.new(mac_key(master), digestmod=hashlib.sha256)
-                  mac.update(header)
-                  with cipher.open("rb") as stream:
-                      for block in iter(lambda: stream.read(1024 * 1024), b""):
-                          mac.update(block)
-                  if not hmac.compare_digest(mac.digest(), tag):
-                      raise Failure("Authentication failed: damaged backup or wrong private key.")
-                  if verify_only:
-                      print("FWENC003 integrity check passed; no plaintext was written.")
-                      return
-                  passfile = work / "passphrase.txt"
-                  passfile.write_text(master.hex() + "\n", encoding="ascii")
-                  payload = work / "decrypted.tar"
-                  crypt(openssl_path, True, salt, passfile, cipher, payload)
-                  with tempfile.NamedTemporaryFile(prefix=".fwplain-", dir=output.parent, delete=False) as out:
-                      temp_output = Path(out.name)
-                      os.chmod(temp_output, 0o600)
-                      with payload.open("rb") as stream:
-                          shutil.copyfileobj(stream, out, 1024 * 1024)
-                      out.flush()
-                      os.fsync(out.fileno())
-                  publish(temp_output, output)
-                  temp_output = None
-                  print(output)
-              finally:
-                  if temp_output:
-                      temp_output.unlink(missing_ok=True)
-                  shutil.rmtree(work, ignore_errors=True)
+                  os.close(fd)
+                  temporary = Path(temporary_name)
+                  temporary.unlink()
+                  try:
+                      subprocess.run(
+                          [
+                              sys.executable, str(helper), "decrypt",
+                              "--private-key", str(private_key),
+                              "--passphrase-file", str(passphrase_file),
+                              "--input", str(encrypted),
+                              "--output", str(temporary),
+                          ],
+                          check=True,
+                      )
+                      os.chmod(temporary, stat.S_IMODE(encrypted.stat().st_mode))
+                      os.replace(temporary, encrypted)
+                  finally:
+                      temporary.unlink(missing_ok=True)
+          finally:
+              for child in work.iterdir():
+                  child.unlink(missing_ok=True)
+              work.rmdir()
 
-          def main():
-              parser = argparse.ArgumentParser()
-              sub = parser.add_subparsers(dest="mode", required=True)
-              enc = sub.add_parser("encrypt")
-              enc.add_argument("--public-key", type=Path, action="append", required=True)
-              enc.add_argument("--input", type=Path, required=True)
-              enc.add_argument("--output", type=Path, required=True)
-              dec = sub.add_parser("decrypt")
-              dec.add_argument("--private-key", type=Path, required=True)
-              dec.add_argument("--passphrase-file", type=Path)
-              dec.add_argument("--input", type=Path, required=True)
-              dec.add_argument("--output", type=Path)
-              dec.add_argument("--verify-only", action="store_true")
-              args = parser.parse_args()
-              try:
-                  if args.mode == "encrypt":
-                      encrypt(args.input, args.public_key, args.output)
-                  else:
-                      if args.verify_only and args.output is not None:
-                          raise Failure("--output cannot be used with --verify-only.")
-                      if not args.verify_only and args.output is None:
-                          raise Failure("--output is required unless --verify-only is used.")
-                      decrypt(args.input, args.private_key, args.output, args.passphrase_file, args.verify_only)
-              except (Failure, OSError) as exc:
-                  print("error: " + str(exc), file=sys.stderr)
-                  raise SystemExit(1)
+          print(f"Decrypted {len(encrypted_files)} app file(s) in the temporary build copy.")
+          PYDECRYPT
 
-          if __name__ == "__main__":
-              main()
-          # END_HYBRID_HELPER
-          PYHELPER
-          chmod 0700 "$helper"
+      - name: Add copyright notices to comment-capable app files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PAGES_SOURCE_COPY/artifacts/mockup-sandbox" <<'PYCOPYRIGHT'
+          import re
+          import sys
+          from pathlib import Path
 
-          if [[ "$operation" == "encrypt-file" || "$operation" == "decrypt-file" || "$operation" == "verify-file" ]]; then
-            if [[ -z "$file_path" || "$file_path" == *$'\n'* || "$file_path" == *$'\r'* ]]; then
-              echo "::error::Enter one repository-relative tracked file path."
-              exit 1
-            fi
-            python3 - "$file_path" <<'PYVALIDATE'
+          root = Path(sys.argv[1])
+          marker = "Copyright © 2025 FERROWORKS."
+          block = """/*!
+           * Copyright © 2025 FERROWORKS.
+           * Do not alter, remove, or misrepresent this notice or the integrity manifest.
+           * Unauthorized tampering may violate applicable license terms or law.
+           * Third-party materials retain their respective copyrights and licenses.
+           */
+          """
+          html = """<!--
+          Copyright © 2025 FERROWORKS.
+          Do not alter, remove, or misrepresent this notice or the integrity manifest.
+          Unauthorized tampering may violate applicable license terms or law.
+          Third-party materials retain their respective copyrights and licenses.
+          -->
+          """
+          hash_comment = """# Copyright © 2025 FERROWORKS.
+          # Do not alter, remove, or misrepresent this notice or the integrity manifest.
+          # Unauthorized tampering may violate applicable license terms or law.
+          # Third-party materials retain their respective copyrights and licenses.
+          """
+
+          for path in root.rglob("*"):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              suffix = path.suffix.lower()
+              if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".css"}:
+                  text = path.read_text(encoding="utf-8")
+                  if marker not in text[:1024]:
+                      path.write_text(block + text, encoding="utf-8")
+              elif suffix == ".html":
+                  text = path.read_text(encoding="utf-8")
+                  if marker not in text[:1024]:
+                      match = re.search(r"<!doctype\s+html[^>]*>", text, flags=re.IGNORECASE)
+                      if match:
+                          text = text[:match.end()] + "\n" + html + text[match.end():]
+                      else:
+                          text = html + text
+                      path.write_text(text, encoding="utf-8")
+              elif suffix in {".yaml", ".yml", ".toml", ".sh"}:
+                  text = path.read_text(encoding="utf-8")
+                  if marker not in text[:1024]:
+                      if suffix == ".sh" and text.startswith("#!"):
+                          first_line, rest = text.split("\n", 1)
+                          text = first_line + "\n" + hash_comment + rest
+                      else:
+                          text = hash_comment + text
+                      path.write_text(text, encoding="utf-8")
+
+          print("Added notices where the file format supports comments.")
+          PYCOPYRIGHT
+
+      - name: Install workspace dependencies
+        working-directory: ${{ runner.temp }}/ferroworks-pages-source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the Vite site
+        working-directory: ${{ runner.temp }}/ferroworks-pages-source
+        env:
+          PORT: "8081"
+          BASE_PATH: ${{ steps.pages-path.outputs.base_path }}
+        run: pnpm --filter @workspace/mockup-sandbox run build
+
+      - name: Add Pages fallback, copyright notice, and file integrity manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$PAGES_SOURCE_COPY/artifacts/mockup-sandbox/dist"
+          cp -- "$dist/index.html" "$dist/404.html"
+          cat > "$dist/COPYRIGHT.txt" <<'COPYRIGHT'
+          Copyright © 2025 FERROWORKS.
+          Do not alter, remove, or misrepresent this notice or the integrity manifest.
+          Unauthorized tampering may violate applicable license terms or law.
+          This notice does not replace or modify any license or notice in this repository.
+          Third-party materials retain their respective copyrights and licenses.
+          COPYRIGHT
+          python3 - "$dist" <<'PYMANIFEST'
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          manifest = root / "COPYRIGHT-MANIFEST.tsv"
+          rows = [
+              "Copyright © 2025 FERROWORKS.",
+              "Do not alter, remove, or misrepresent this notice or the integrity manifest.",
+              "Unauthorized tampering may violate applicable license terms or law.",
+              "SHA-256\tFILE",
+          ]
+          files = sorted(path for path in root.rglob("*") if path.is_file() and path != manifest)
+          for path in files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              rows.append(f"{digest}\t{path.relative_to(root).as_posix()}")
+          manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+          PYMANIFEST
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: ${{ runner.temp }}/ferroworks-pages-source/artifacts/mockup-sandbox/dist
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+
+      - name: Encrypt app source after successful deployment
+        shell: bash
+        env:
+          BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
+          BACKUP_DECRYPT_PRIVATE_KEY: ${{ secrets.BACKUP_DECRYPT_PRIVATE_KEY }}
+          BACKUP_DECRYPT_PASSPHRASE: ${{ secrets.BACKUP_DECRYPT_PASSPHRASE }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE" "$PAGES_SOURCE_COPY" "$FWENC_HELPER" <<'PYENCRYPT'
           import os
+          import stat
           import subprocess
           import sys
-          from pathlib import Path, PurePosixPath
-          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-          raw = sys.argv[1]
-          rel = PurePosixPath(raw)
-          if rel.is_absolute() or not rel.parts or any(part in ("", ".", "..", ".git") for part in rel.parts):
-              raise SystemExit("Unsafe file path; use a tracked repository-relative path outside .git.")
-          if rel.parts[:2] in ((".github", "workflows"), (".github", "backup-recipients")):
-              raise SystemExit("Workflow files and recipient public-key files cannot be transformed.")
-          current = root
-          for part in rel.parts:
-              current = current / part
-              if current.is_symlink():
-                  raise SystemExit("Symbolic-link paths are not accepted.")
-          if not current.is_file():
-              raise SystemExit("The selected path must be an existing regular file.")
-          normalized = current.relative_to(root).as_posix()
-          result = subprocess.run(
-              ["git", "ls-files", "--error-unmatch", "--", ":(literal)" + normalized],
-              cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          )
-          if result.returncode:
-              raise SystemExit("The selected file must already be tracked by Git.")
-          PYVALIDATE
-            target="$GITHUB_WORKSPACE/$file_path"
-            original_mode="$(stat -c '%a' -- "$target")"
-            selected_output="$work_dir/selected-file.result"
-            if [[ "$operation" == "encrypt-file" ]]; then
-              if python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read(8) == b"FWENC003" else 1)' "$target"; then
-                echo "::error::The selected file is already in FWENC003 format."
-                exit 1
-              fi
-              python3 "$helper" encrypt --input "$target" --output "$selected_output" "${recipient_args[@]}" \
-                | tee "$work_dir/file-operation-report.txt"
-            else
-              if [[ -z "${BACKUP_DECRYPT_PRIVATE_KEY:-}" ]]; then
-                echo "::error title=Private key missing::Add BACKUP_DECRYPT_PRIVATE_KEY as a repository secret; private keys cannot be entered as dispatch inputs."
-                exit 1
-              fi
-              if ! python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read(8) == b"FWENC003" else 1)' "$target"; then
-                echo "::error::The selected file is not an FWENC003 encrypted file."
-                exit 1
-              fi
-              private_key="$work_dir/decrypt-private.pem"
-              passphrase_file="$work_dir/decrypt-passphrase.txt"
-              printf '%s' "$BACKUP_DECRYPT_PRIVATE_KEY" > "$private_key"
-              printf '%s\n' "${BACKUP_DECRYPT_PASSPHRASE:-}" > "$passphrase_file"
-              chmod 0600 "$private_key" "$passphrase_file"
-              if [[ "$operation" == "verify-file" ]]; then
-                python3 "$helper" decrypt \
-                  --private-key "$private_key" \
-                  --passphrase-file "$passphrase_file" \
-                  --input "$target" \
-                  --verify-only
-                {
-                  echo "### FERROWORKS / Integrity verification"
-                  echo "- Result: FWENC003 authentication tag verified"
-                  echo "- File: $file_path"
-                  echo "- Branch: $GITHUB_REF_NAME"
-                  echo "- File changed: no"
-                } >> "$GITHUB_STEP_SUMMARY"
-                echo "Verified $file_path without writing plaintext or changing the branch."
-                exit 0
-              fi
-              python3 "$helper" decrypt \
-                --private-key "$private_key" \
-                --passphrase-file "$passphrase_file" \
-                --input "$target" \
-                --output "$selected_output"
-            fi
-            chmod --reference="$target" "$selected_output"
-            mv -- "$selected_output" "$target"
-            selected_output=""
-            git add -- ":(literal)$file_path"
-            commit_message="[$operation] $file_path [skip ci]"
-            {
-              echo "### FERROWORKS / File operation"
-              echo "- Operation: $operation"
-              echo "- File: $file_path"
-              echo "- Branch: $GITHUB_REF_NAME"
-            } >> "$GITHUB_STEP_SUMMARY"
-            if [[ "$operation" == "encrypt-file" ]]; then
-              append_ciphertext_preview "$target"
-            fi
+          import tempfile
+          from pathlib import Path
+
+          workspace = Path(sys.argv[1]).resolve()
+          source_copy = Path(sys.argv[2]).resolve()
+          helper = Path(sys.argv[3]).resolve()
+          site_rel = Path("artifacts/mockup-sandbox")
+          site_root = workspace / site_rel
+          source_root = source_copy / site_rel
+
+          def should_encrypt(rel):
+              parts = rel.parts
+              lower = [part.lower() for part in parts]
+              if any(part in {"node_modules", "dist"} for part in lower):
+                  return False
+              if ".replit-artifact" in lower:
+                  return False
+              if rel.suffix.lower() in {".md", ".markdown"}:
+                  return False
+              if rel.name.lower().startswith("readme"):
+                  return False
+              return True
+
+          tracked = subprocess.run(
+              ["git", "ls-files", "-z", "--", site_rel.as_posix()],
+              cwd=workspace, check=True, capture_output=True,
+          ).stdout.split(b"\0")
+          candidates = []
+          for item in tracked:
+              if not item:
+                  continue
+              rel = Path(os.fsdecode(item))
+              if not should_encrypt(rel.relative_to(site_rel)):
+                  continue
+              target = workspace / rel
+              if not target.is_file() or target.is_symlink():
+                  continue
+              with target.open("rb") as stream:
+                  if stream.read(8) == b"FWENC003":
+                      continue
+              source = source_copy / rel
+              if not source.is_file():
+                  raise SystemExit(f"Decrypted build copy is missing tracked file: {rel}")
+              candidates.append((rel, target, source))
+
+          if not candidates:
+              print("All eligible mockup app files are already encrypted.")
+              raise SystemExit(0)
+
+          public_keys = sorted((workspace / ".github" / "backup-recipients").glob("*.pem"))
+          temporary_dir = Path(tempfile.mkdtemp(prefix="fw-pages-encrypt-", dir=os.environ["RUNNER_TEMP"]))
+          os.chmod(temporary_dir, 0o700)
+          try:
+              configured_public = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
+              if configured_public:
+                  configured_path = temporary_dir / "configured-recipient.pem"
+                  configured_path.write_text(configured_public, encoding="utf-8")
+                  os.chmod(configured_path, 0o600)
+                  public_keys.append(configured_path)
+              if not public_keys:
+                  raise SystemExit(
+                      "Pages deployed, but source remains plaintext: configure BACKUP_RECIPIENT_PUBLIC_KEY "
+                      "or add a public PEM under .github/backup-recipients/."
+                  )
+
+              private_key_text = os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", "")
+              if not private_key_text:
+                  raise SystemExit(
+                      "Pages deployed, but source remains plaintext: add BACKUP_DECRYPT_PRIVATE_KEY "
+                      "as a repository secret before enabling source encryption."
+                  )
+              private_key = temporary_dir / "private.pem"
+              passphrase_file = temporary_dir / "passphrase.txt"
+              private_key.write_text(private_key_text, encoding="utf-8")
+              passphrase_file.write_text(
+                  os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\n") + "\n",
+                  encoding="utf-8",
+              )
+              os.chmod(private_key, 0o600)
+              os.chmod(passphrase_file, 0o600)
+
+              public_args = []
+              for key in public_keys:
+                  public_args.extend(["--public-key", str(key)])
+
+              # Confirm the configured private key can decrypt a new file before
+              # replacing any source files in the checked-out branch.
+              test_input = temporary_dir / "key-check.txt"
+              test_encrypted = temporary_dir / "key-check.fwenc"
+              test_input.write_text("FERROWORKS Pages key check\n", encoding="utf-8")
+              subprocess.run(
+                  [
+                      sys.executable, str(helper), "encrypt",
+                      "--input", str(test_input), "--output", str(test_encrypted),
+                      *public_args,
+                  ],
+                  check=True,
+              )
+              subprocess.run(
+                  [
+                      sys.executable, str(helper), "decrypt",
+                      "--private-key", str(private_key),
+                      "--passphrase-file", str(passphrase_file),
+                      "--input", str(test_encrypted),
+                      "--verify-only",
+                  ],
+                  check=True,
+              )
+
+              for rel, target, source in candidates:
+                  fd, temporary_name = tempfile.mkstemp(prefix=".fwenc-", dir=target.parent)
+                  os.close(fd)
+                  temporary = Path(temporary_name)
+                  temporary.unlink()
+                  try:
+                      subprocess.run(
+                          [
+                              sys.executable, str(helper), "encrypt",
+                              "--input", str(source), "--output", str(temporary),
+                              *public_args,
+                          ],
+                          check=True,
+                      )
+                      os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+                      os.replace(temporary, target)
+                      subprocess.run(
+                          ["git", "add", "--", ":(literal)" + rel.as_posix()],
+                          cwd=workspace, check=True,
+                      )
+                  finally:
+                      temporary.unlink(missing_ok=True)
+          finally:
+              for child in temporary_dir.iterdir():
+                  child.unlink(missing_ok=True)
+              temporary_dir.rmdir()
+
+          print(f"Encrypted {len(candidates)} mockup app file(s) after deployment.")
+          PYENCRYPT
+
+          if ! git diff --cached --quiet -- artifacts/mockup-sandbox; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "[FERROWORKS] Encrypt Pages source after deploy [skip ci]"
+            git push origin "HEAD:${DEFAULT_BRANCH}"
           else
-            python3 "$helper" encrypt \
-              --input "$payload" \
-              --output "$encrypted" \
-              "${recipient_args[@]}" | tee "$work_dir/encryption-report.txt"
-
-            {
-              echo "### Encrypted Git backup"
-              echo "- Branch/ref: $GITHUB_REF"
-              echo "- Commit: $GITHUB_SHA"
-              echo "- Triggered by: $GITHUB_ACTOR"
-              echo "- Recipient keys configured: ${#recipient_keys[@]}"
-              grep '^Recipient key fingerprints:' "$work_dir/encryption-report.txt"
-            } >> "$GITHUB_STEP_SUMMARY"
-            append_ciphertext_preview "$encrypted"
-
-            (
-              cd "$artifact_dir"
-              sha256sum "$(basename "$encrypted")" > "$(basename "$encrypted").sha256"
-              sha256sum --check "$(basename "$encrypted").sha256"
-            )
-
-            backup_dir="$GITHUB_WORKSPACE/.github/encrypted-backups"
-            mkdir -p "$backup_dir"
-            cp -- "$encrypted" "$backup_dir/"
-            cp -- "$encrypted.sha256" "$backup_dir/"
-            git add -- ".github/encrypted-backups/$(basename "$encrypted")" ".github/encrypted-backups/$(basename "$encrypted").sha256"
-            commit_message="[encrypted-backup] ${GITHUB_REF_NAME} ${GITHUB_SHA} [skip ci]"
+            echo "No plaintext Pages source files needed encryption."
           fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "$commit_message"
-          git push origin "HEAD:${GITHUB_REF}"
-          echo "Committed ${operation} output to ${GITHUB_REF}."
-
-          rm -rf -- "$work_dir"
-          rm -rf -- "$artifact_dir"
-          rm -f -- "$configured_public_key" "$dispatch_public_key"
