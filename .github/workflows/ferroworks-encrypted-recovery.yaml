@@ -51,11 +51,6 @@ jobs:
         with:
           node-version: 24
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.26.1
-
       - name: Install pinned cryptography library
         run: python3 -m pip install --disable-pip-version-check --no-warn-script-location cryptography==50.0.2
 
@@ -433,16 +428,13 @@ jobs:
           print("Added notices where the file format supports comments.")
           PYCOPYRIGHT
 
-      - name: Install workspace dependencies
-        working-directory: ${{ runner.temp }}/ferroworks-pages-source
-        run: pnpm install --frozen-lockfile
-
-      - name: Build the Vite site
-        working-directory: ${{ runner.temp }}/ferroworks-pages-source
-        env:
-          PORT: "8081"
-          BASE_PATH: ${{ steps.pages-path.outputs.base_path }}
-        run: pnpm --filter @workspace/production run build
+      - name: Assemble the production site
+        working-directory: ${{ runner.temp }}/ferroworks-pages-source/artifacts/production
+        run: |
+          set -euo pipefail
+          rm -rf -- dist
+          mkdir -p -- dist
+          cp -- index.html dist/index.html
 
       - name: Minify and obfuscate published assets
         shell: bash
