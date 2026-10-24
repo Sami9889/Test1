@@ -51,11 +51,6 @@ jobs:
         with:
           node-version: 24
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.26.1
-
       - name: Install pinned cryptography library
         run: python3 -m pip install --disable-pip-version-check --no-warn-script-location cryptography==50.0.2
 
@@ -301,7 +296,7 @@ jobs:
         run: |
           set -euo pipefail
           source_copy="$RUNNER_TEMP/ferroworks-pages-source"
-          app="$source_copy/artifacts/mockup-sandbox"
+          app="$source_copy/artifacts/production"
           rm -rf -- "$source_copy"
           mkdir -m 0700 "$source_copy"
           rsync -a \
@@ -314,7 +309,7 @@ jobs:
             --exclude='attached_assets/' \
             --exclude='.github/encrypted-backups/' \
             "$GITHUB_WORKSPACE/" "$source_copy/"
-          test -d "$app" || { echo "Expected app directory is missing: artifacts/mockup-sandbox" >&2; exit 1; }
+          test -d "$app" || { echo "Expected app directory is missing: artifacts/production" >&2; exit 1; }
           echo "PAGES_SOURCE_COPY=$source_copy" >> "$GITHUB_ENV"
           python3 - "$app" "$FWENC_HELPER" "$RUNNER_TEMP" <<'PYDECRYPT'
           import os
@@ -377,7 +372,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - "$PAGES_SOURCE_COPY/artifacts/mockup-sandbox" <<'PYCOPYRIGHT'
+          python3 - "$PAGES_SOURCE_COPY/artifacts/production" <<'PYCOPYRIGHT'
           import re
           import sys
           from pathlib import Path
@@ -433,22 +428,19 @@ jobs:
           print("Added notices where the file format supports comments.")
           PYCOPYRIGHT
 
-      - name: Install workspace dependencies
-        working-directory: ${{ runner.temp }}/ferroworks-pages-source
-        run: pnpm install --frozen-lockfile
-
-      - name: Build the Vite site
-        working-directory: ${{ runner.temp }}/ferroworks-pages-source
-        env:
-          PORT: "8081"
-          BASE_PATH: ${{ steps.pages-path.outputs.base_path }}
-        run: pnpm --filter @workspace/mockup-sandbox run build
+      - name: Assemble the production site
+        working-directory: ${{ runner.temp }}/ferroworks-pages-source/artifacts/production
+        run: |
+          set -euo pipefail
+          rm -rf -- dist
+          mkdir -p -- dist
+          cp -- index.html dist/index.html
 
       - name: Minify and obfuscate published assets
         shell: bash
         run: |
           set -euo pipefail
-          dist="$PAGES_SOURCE_COPY/artifacts/mockup-sandbox/dist"
+          dist="$PAGES_SOURCE_COPY/artifacts/production/dist"
           test -f "$dist/index.html"
           node "$RUNNER_TEMP/fw-asset-tools/node_modules/html-minifier-terser/cli.js" \
             --collapse-whitespace --remove-comments --remove-optional-tags \
@@ -508,7 +500,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dist="$PAGES_SOURCE_COPY/artifacts/mockup-sandbox/dist"
+          dist="$PAGES_SOURCE_COPY/artifacts/production/dist"
           test -f "$dist/index.html"
           cp -- "$dist/index.html" "$dist/404.html"
           cat > "$dist/COPYRIGHT.txt" <<'COPYRIGHT'
@@ -541,7 +533,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
-          path: ${{ runner.temp }}/ferroworks-pages-source/artifacts/mockup-sandbox/dist
+          path: ${{ runner.temp }}/ferroworks-pages-source/artifacts/production/dist
 
       - name: Deploy Pages
         id: deployment
@@ -566,7 +558,7 @@ jobs:
           from pathlib import Path
 
           workspace, source_copy, helper, temp_root = map(Path, sys.argv[1:])
-          site_rel = Path("artifacts/mockup-sandbox")
+          site_rel = Path("artifacts/production")
           site_root = workspace / site_rel
           source_root = source_copy / site_rel
 
@@ -709,7 +701,7 @@ jobs:
           print(f"Encrypted {len(candidates)} tracked app file(s) after deployment.")
           PYENCRYPT
 
-          if ! git diff --cached --quiet -- artifacts/mockup-sandbox .github/encrypted-backups; then
+          if ! git diff --cached --quiet -- artifacts/production .github/encrypted-backups; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -m "[FERROWORKS] Encrypt Pages source after deploy [skip ci]"
