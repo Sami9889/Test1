@@ -1,5 +1,7 @@
 # Copyright © 2025 FERROWORKS.
 # Do not remove or alter this notice. Unauthorized tampering may violate applicable law or license terms.
+# GitHub Actions must read this workflow as plaintext; each revision is also preserved as an authenticated
+# encrypted FWENC004 snapshot in .github/encrypted-backups after a successful Pages deployment.
 name: FERROWORKS Pages decrypt and deploy
 
 on:
@@ -17,7 +19,7 @@ permissions:
 
 concurrency:
   group: ferroworks-pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -25,12 +27,14 @@ jobs:
     if: >-
       ${{
         (github.event_name == 'workflow_dispatch' &&
-         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+         github.ref_name == github.event.repository.default_branch) ||
         (github.event_name == 'workflow_run' &&
          github.event.workflow_run.conclusion == 'success' &&
-         github.event.workflow_run.head_branch == github.event.repository.default_branch)
+         github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+         github.event.workflow_run.head_repository.full_name == github.repository)
       }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -52,6 +56,227 @@ jobs:
         with:
           version: 10.26.1
 
+      - name: Install pinned cryptography library
+        run: python3 -m pip install --disable-pip-version-check --no-warn-script-location cryptography==50.0.2
+
+      - name: Install pinned static-asset transformers
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/fw-asset-tools" --no-save --no-package-lock javascript-obfuscator@5.9.0 html-minifier-terser@7.2.0
+
+      - name: Prepare the embedded encryption helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper="$RUNNER_TEMP/fwenc.py"
+          umask 077
+          cat > "$helper" <<'PYTHON'
+          import argparse
+          import base64
+          import hashlib
+          import json
+          import os
+          import secrets
+          import stat
+          import struct
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          from cryptography.exceptions import InvalidTag
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding, rsa
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          MAGIC = b"FWENC004"
+          MAX_FILE = 512 * 1024 * 1024
+          MAX_HEADER = 16 * 1024
+          MAX_RECIPIENTS = 32
+          OAEP = padding.OAEP(
+              mgf=padding.MGF1(algorithm=hashes.SHA256()),
+              algorithm=hashes.SHA256(),
+              label=b"FERROWORKS-FWENC004",
+          )
+
+          def fail(message):
+              raise ValueError(message)
+
+          def read_limited(path):
+              size = path.stat().st_size
+              if size > MAX_FILE:
+                  fail(f"Refusing file larger than {MAX_FILE} bytes: {path}")
+              data = path.read_bytes()
+              if len(data) > MAX_FILE:
+                  fail(f"Refusing file larger than {MAX_FILE} bytes: {path}")
+              return data
+
+          def public_key_id(public_key):
+              der = public_key.public_bytes(
+                  serialization.Encoding.DER,
+                  serialization.PublicFormat.SubjectPublicKeyInfo,
+              )
+              return hashlib.sha256(der).hexdigest()
+
+          def check_rsa(key):
+              if not isinstance(key, rsa.RSAPublicKey) and not isinstance(key, rsa.RSAPrivateKey):
+                  fail("FWENC004 requires RSA keys; provide a PEM RSA key pair.")
+              if key.key_size < 3072 or key.key_size > 8192:
+                  fail("RSA keys must be between 3072 and 8192 bits.")
+
+          def b64decode(value, label):
+              if not isinstance(value, str):
+                  fail(f"Invalid {label} encoding.")
+              try:
+                  return base64.b64decode(value, validate=True)
+              except (ValueError, base64.binascii.Error):
+                  fail(f"Invalid {label} encoding.")
+
+          def atomic_write(destination, data):
+              destination = Path(destination)
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              fd, temporary_name = tempfile.mkstemp(prefix=".fwenc-", dir=destination.parent)
+              temporary = Path(temporary_name)
+              try:
+                  with os.fdopen(fd, "wb") as stream:
+                      os.fchmod(stream.fileno(), 0o600)
+                      stream.write(data)
+                      stream.flush()
+                      os.fsync(stream.fileno())
+                  os.replace(temporary, destination)
+              finally:
+                  temporary.unlink(missing_ok=True)
+
+          def encrypt(args):
+              source = Path(args.input)
+              destination = Path(args.output)
+              plaintext = read_limited(source)
+              if not args.public_key:
+                  fail("At least one --public-key is required.")
+              if len(args.public_key) > MAX_RECIPIENTS:
+                  fail(f"At most {MAX_RECIPIENTS} recipient keys are supported.")
+
+              recipient_keys = {}
+              for key_path in args.public_key:
+                  public_key = serialization.load_pem_public_key(Path(key_path).read_bytes())
+                  check_rsa(public_key)
+                  recipient_keys[public_key_id(public_key)] = public_key
+
+              # Use one random content key and wrap it independently for every recipient.
+              content_key = secrets.token_bytes(32)
+              wrapped_recipients = []
+              for key_id, public_key in sorted(recipient_keys.items()):
+                  wrapped_recipients.append({
+                      "kid": key_id,
+                      "wrapped": base64.b64encode(public_key.encrypt(content_key, OAEP)).decode("ascii"),
+                  })
+              header = {
+                  "alg": "RSA-OAEP-SHA256+A256GCM",
+                  "nonce": base64.b64encode(secrets.token_bytes(12)).decode("ascii"),
+                  "recipients": wrapped_recipients,
+                  "v": 4,
+              }
+              header_bytes = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("ascii")
+              if len(header_bytes) > MAX_HEADER:
+                  fail("Encryption header exceeds the allowed size.")
+              prefix = MAGIC + struct.pack(">I", len(header_bytes)) + header_bytes
+              ciphertext = AESGCM(content_key).encrypt(
+                  base64.b64decode(header["nonce"]), plaintext, prefix
+              )
+              atomic_write(destination, prefix + ciphertext)
+
+          def reject_duplicate_fields(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail("Duplicate encryption header field.")
+                  result[key] = value
+              return result
+
+          def decrypt(args):
+              source = Path(args.input)
+              blob = read_limited(source)
+              if len(blob) < 12 or blob[:8] != MAGIC:
+                  if blob[:8] == b"FWENC003":
+                      fail("Legacy FWENC003 files are not supported by this workflow. Restore trusted plaintext and re-encrypt with FWENC004 before deploying.")
+                  fail("Unsupported or invalid encrypted file format (expected FWENC004).")
+              header_size = struct.unpack(">I", blob[8:12])[0]
+              if header_size == 0 or header_size > MAX_HEADER or 12 + header_size + 16 > len(blob):
+                  fail("Invalid or truncated encryption header.")
+              header_bytes = blob[12:12 + header_size]
+              try:
+                  header = json.loads(header_bytes, object_pairs_hook=reject_duplicate_fields)
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  fail("Invalid encryption header.")
+              if not isinstance(header, dict) or set(header) != {"alg", "nonce", "recipients", "v"}:
+                  fail("Invalid encryption header fields.")
+              if header["v"] != 4 or header["alg"] != "RSA-OAEP-SHA256+A256GCM":
+                  fail("Unsupported encryption version or algorithm.")
+              nonce = b64decode(header["nonce"], "nonce")
+              if len(nonce) != 12:
+                  fail("Invalid AES-GCM nonce length.")
+              recipients = header["recipients"]
+              if not isinstance(recipients, list) or not 1 <= len(recipients) <= MAX_RECIPIENTS:
+                  fail("Invalid recipient list.")
+              if args.passphrase_file:
+                  passphrase = Path(args.passphrase_file).read_bytes().rstrip(b"\r\n") or None
+              else:
+                  passphrase = None
+              private_key = serialization.load_pem_private_key(
+                  Path(args.private_key).read_bytes(), password=passphrase
+              )
+              check_rsa(private_key)
+              wanted_id = public_key_id(private_key.public_key())
+              wrapped_key = None
+              for recipient in recipients:
+                  if not isinstance(recipient, dict) or set(recipient) != {"kid", "wrapped"}:
+                      fail("Invalid recipient entry.")
+                  kid = recipient["kid"]
+                  if not isinstance(kid, str) or len(kid) != 64:
+                      fail("Invalid recipient key identifier.")
+                  if kid == wanted_id:
+                      wrapped_key = b64decode(recipient["wrapped"], "wrapped key")
+                      break
+              if wrapped_key is None:
+                  fail("This private key is not an encryption recipient.")
+              try:
+                  content_key = private_key.decrypt(wrapped_key, OAEP)
+                  if len(content_key) != 32:
+                      fail("Invalid content encryption key.")
+                  plaintext = AESGCM(content_key).decrypt(
+                      nonce, blob[12 + header_size:], blob[:12 + header_size]
+                  )
+              except (ValueError, InvalidTag):
+                  fail("Decryption or authentication failed; ciphertext may be corrupted or tampered with.")
+              if len(plaintext) > MAX_FILE:
+                  fail("Decrypted file exceeds the allowed size.")
+              atomic_write(args.output, plaintext)
+
+          def main():
+              parser = argparse.ArgumentParser(description="FERROWORKS authenticated hybrid file encryption")
+              subparsers = parser.add_subparsers(dest="command", required=True)
+              enc = subparsers.add_parser("encrypt")
+              enc.add_argument("--input", required=True)
+              enc.add_argument("--output", required=True)
+              enc.add_argument("--public-key", action="append", default=[])
+              dec = subparsers.add_parser("decrypt")
+              dec.add_argument("--input", required=True)
+              dec.add_argument("--output", required=True)
+              dec.add_argument("--private-key", required=True)
+              dec.add_argument("--passphrase-file")
+              args = parser.parse_args()
+              try:
+                  (encrypt if args.command == "encrypt" else decrypt)(args)
+              except Exception as error:
+                  print(f"FWENC: {error}", file=sys.stderr)
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON
+          chmod 0700 "$helper"
+          echo "FWENC_HELPER=$helper" >> "$GITHUB_ENV"
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
 
@@ -68,20 +293,15 @@ jobs:
           fi
           echo "base_path=$base_path" >> "$GITHUB_OUTPUT"
 
-      - name: Make a temporary build copy and decrypt encrypted app files
+      - name: Decrypt app files in a temporary build copy
         shell: bash
         env:
           BACKUP_DECRYPT_PRIVATE_KEY: ${{ secrets.BACKUP_DECRYPT_PRIVATE_KEY }}
           BACKUP_DECRYPT_PASSPHRASE: ${{ secrets.BACKUP_DECRYPT_PASSPHRASE }}
         run: |
           set -euo pipefail
-          helper="$RUNNER_TEMP/ferroworks_hybrid_encrypt.py"
           source_copy="$RUNNER_TEMP/ferroworks-pages-source"
-
-          awk '/^          # BEGIN_HYBRID_HELPER$/{inside=1;next} /^          # END_HYBRID_HELPER$/{inside=0;exit} inside{sub(/^          /,"");print}' \
-            .github/workflows/ferroworks-encrypted-recovery.yml > "$helper"
-          chmod 0700 "$helper"
-
+          app="$source_copy/artifacts/mockup-sandbox"
           rm -rf -- "$source_copy"
           mkdir -m 0700 "$source_copy"
           rsync -a \
@@ -94,11 +314,9 @@ jobs:
             --exclude='attached_assets/' \
             --exclude='.github/encrypted-backups/' \
             "$GITHUB_WORKSPACE/" "$source_copy/"
-
+          test -d "$app" || { echo "Expected app directory is missing: artifacts/mockup-sandbox" >&2; exit 1; }
           echo "PAGES_SOURCE_COPY=$source_copy" >> "$GITHUB_ENV"
-          echo "FWENC_HELPER=$helper" >> "$GITHUB_ENV"
-
-          python3 - "$source_copy" "$helper" <<'PYDECRYPT'
+          python3 - "$app" "$FWENC_HELPER" "$RUNNER_TEMP" <<'PYDECRYPT'
           import os
           import stat
           import subprocess
@@ -106,67 +324,53 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          root = Path(sys.argv[1])
-          helper = Path(sys.argv[2])
-          app = root / "artifacts" / "mockup-sandbox"
-          encrypted_files = []
-          for path in app.rglob("*"):
+          app, helper, temp_root = map(Path, sys.argv[1:])
+          encrypted = []
+          for path in sorted(app.rglob("*")):
               if path.is_file() and not path.is_symlink():
                   with path.open("rb") as stream:
-                      if stream.read(8) == b"FWENC003":
-                          encrypted_files.append(path)
-
-          if not encrypted_files:
-              print("No encrypted mockup app files found; using the checked-out source.")
+                      if stream.read(8) in {b"FWENC003", b"FWENC004"}:
+                          encrypted.append(path)
+          if not encrypted:
+              print("No encrypted app files found in the isolated build copy.")
               raise SystemExit(0)
 
-          private_key_text = os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", "")
-          if not private_key_text:
-              raise SystemExit(
-                  "Encrypted Pages source exists. Add BACKUP_DECRYPT_PRIVATE_KEY as a repository secret."
-              )
-
-          work = Path(tempfile.mkdtemp(prefix="fw-pages-decrypt-", dir=os.environ["RUNNER_TEMP"]))
+          private_text = os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", "")
+          if not private_text:
+              raise SystemExit("Encrypted app files exist. Configure BACKUP_DECRYPT_PRIVATE_KEY.")
+          work = Path(tempfile.mkdtemp(prefix="fw-pages-decrypt-", dir=temp_root))
           os.chmod(work, 0o700)
+          staged = work / "staged"
+          staged.mkdir(mode=0o700)
           private_key = work / "private.pem"
           passphrase_file = work / "passphrase.txt"
-          private_key.write_text(private_key_text, encoding="utf-8")
-          passphrase_file.write_text(
-              os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\n") + "\n",
-              encoding="utf-8",
-          )
+          private_key.write_text(private_text, encoding="utf-8")
+          passphrase_file.write_text(os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\r\n"), encoding="utf-8")
           os.chmod(private_key, 0o600)
           os.chmod(passphrase_file, 0o600)
-
           try:
-              for encrypted in encrypted_files:
-                  fd, temporary_name = tempfile.mkstemp(
-                      prefix=".fwplain-", dir=encrypted.parent
-                  )
-                  os.close(fd)
-                  temporary = Path(temporary_name)
-                  temporary.unlink()
-                  try:
-                      subprocess.run(
-                          [
-                              sys.executable, str(helper), "decrypt",
-                              "--private-key", str(private_key),
-                              "--passphrase-file", str(passphrase_file),
-                              "--input", str(encrypted),
-                              "--output", str(temporary),
-                          ],
-                          check=True,
-                      )
-                      os.chmod(temporary, stat.S_IMODE(encrypted.stat().st_mode))
-                      os.replace(temporary, encrypted)
-                  finally:
-                      temporary.unlink(missing_ok=True)
+              for encrypted_path in encrypted:
+                  relative = encrypted_path.relative_to(app)
+                  destination = staged / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                  subprocess.run([
+                      sys.executable, str(helper), "decrypt",
+                      "--private-key", str(private_key),
+                      "--passphrase-file", str(passphrase_file),
+                      "--input", str(encrypted_path), "--output", str(destination),
+                  ], check=True)
+                  os.chmod(destination, stat.S_IMODE(encrypted_path.stat().st_mode))
+              for encrypted_path in encrypted:
+                  relative = encrypted_path.relative_to(app)
+                  os.replace(staged / relative, encrypted_path)
           finally:
-              for child in work.iterdir():
-                  child.unlink(missing_ok=True)
+              for path in sorted(work.rglob("*"), reverse=True):
+                  if path.is_file() or path.is_symlink():
+                      path.unlink(missing_ok=True)
+                  elif path.is_dir():
+                      path.rmdir()
               work.rmdir()
-
-          print(f"Decrypted {len(encrypted_files)} app file(s) in the temporary build copy.")
+          print(f"Decrypted {len(encrypted)} app file(s) in the isolated build copy.")
           PYDECRYPT
 
       - name: Add copyright notices to comment-capable app files
@@ -226,7 +430,6 @@ jobs:
                       else:
                           text = hash_comment + text
                       path.write_text(text, encoding="utf-8")
-
           print("Added notices where the file format supports comments.")
           PYCOPYRIGHT
 
@@ -241,11 +444,72 @@ jobs:
           BASE_PATH: ${{ steps.pages-path.outputs.base_path }}
         run: pnpm --filter @workspace/mockup-sandbox run build
 
+      - name: Minify and obfuscate published assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$PAGES_SOURCE_COPY/artifacts/mockup-sandbox/dist"
+          test -f "$dist/index.html"
+          node "$RUNNER_TEMP/fw-asset-tools/node_modules/html-minifier-terser/cli.js" \
+            --collapse-whitespace --remove-comments --remove-optional-tags \
+            --remove-redundant-attributes --remove-script-type-attributes \
+            --remove-style-link-type-attributes --use-short-doctype --minify-css true \
+            --minify-js true "$dist/index.html" -o "$RUNNER_TEMP/fw-index.min.html"
+          mv -- "$RUNNER_TEMP/fw-index.min.html" "$dist/index.html"
+          # Source maps preserve the original source, defeating obfuscation; remove maps and their trailers.
+          find "$dist" -type f -name '*.map' -delete
+          mapfile -d '' assets < <(find "$dist" -type f \( -iname '*.js' -o -iname '*.mjs' -o -iname '*.css' \) -print0)
+          js_count=0
+          if ((${#assets[@]})); then
+            node - "$RUNNER_TEMP/fw-asset-tools/node_modules/javascript-obfuscator" "${assets[@]}" <<'JSOBFUSCATE'
+          const fs = require('node:fs');
+          const Obfuscator = require(process.argv[2]);
+          const files = process.argv.slice(3);
+          const stripSourceMap = source => source.replace(/(?:\/\/[#@]\s*sourceMappingURL=.*?$|\/\*[#@]\s*sourceMappingURL=.*?\*\/)/gm, '');
+          let jsCount = 0;
+          for (const file of files) {
+            const source = stripSourceMap(fs.readFileSync(file, 'utf8'));
+            if (/\.m?js$/i.test(file)) {
+              const result = Obfuscator.obfuscate(source, {
+                compact: true,
+                target: 'browser',
+                ignoreImports: true,
+                identifierNamesGenerator: 'hexadecimal',
+                renameGlobals: false,
+                renameProperties: false,
+                selfDefending: false,
+                simplify: true,
+                splitStrings: true,
+                splitStringsChunkLength: 8,
+                stringArray: true,
+                stringArrayCallsTransform: false,
+                stringArrayEncoding: ['base64'],
+                stringArrayRotate: true,
+                stringArrayShuffle: true,
+                stringArrayThreshold: 0.6,
+                transformObjectKeys: false,
+                unicodeEscapeSequence: false
+              });
+              fs.writeFileSync(file, result.getObfuscatedCode(), { mode: fs.statSync(file).mode });
+              jsCount++;
+            } else {
+              fs.writeFileSync(file, source, { mode: fs.statSync(file).mode });
+            }
+          }
+          console.log(`Obfuscated ${jsCount} JavaScript bundle(s) and stripped source-map links.`);
+          if (process.env.GITHUB_OUTPUT) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `javascript_bundles_obfuscated=${jsCount}\\n`);
+          }
+          JSOBFUSCATE
+          fi
+          echo "Minified the HTML and obfuscated JavaScript bundles for delivery."
+
       - name: Add Pages fallback, copyright notice, and file integrity manifest
         shell: bash
         run: |
           set -euo pipefail
           dist="$PAGES_SOURCE_COPY/artifacts/mockup-sandbox/dist"
+          test -f "$dist/index.html"
           cp -- "$dist/index.html" "$dist/404.html"
           cat > "$dist/COPYRIGHT.txt" <<'COPYRIGHT'
           Copyright © 2025 FERROWORKS.
@@ -289,10 +553,11 @@ jobs:
           BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
           BACKUP_DECRYPT_PRIVATE_KEY: ${{ secrets.BACKUP_DECRYPT_PRIVATE_KEY }}
           BACKUP_DECRYPT_PASSPHRASE: ${{ secrets.BACKUP_DECRYPT_PASSPHRASE }}
+          BACKUP_ENCRYPT_WORKFLOW: "false"
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_WORKSPACE" "$PAGES_SOURCE_COPY" "$FWENC_HELPER" <<'PYENCRYPT'
+          python3 - "$GITHUB_WORKSPACE" "$PAGES_SOURCE_COPY" "$FWENC_HELPER" "$RUNNER_TEMP" <<'PYENCRYPT'
           import os
           import stat
           import subprocess
@@ -300,16 +565,13 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          workspace = Path(sys.argv[1]).resolve()
-          source_copy = Path(sys.argv[2]).resolve()
-          helper = Path(sys.argv[3]).resolve()
+          workspace, source_copy, helper, temp_root = map(Path, sys.argv[1:])
           site_rel = Path("artifacts/mockup-sandbox")
           site_root = workspace / site_rel
           source_root = source_copy / site_rel
 
           def should_encrypt(rel):
-              parts = rel.parts
-              lower = [part.lower() for part in parts]
+              lower = [part.lower() for part in rel.parts]
               if any(part in {"node_modules", "dist"} for part in lower):
                   return False
               if ".replit-artifact" in lower:
@@ -335,108 +597,119 @@ jobs:
               if not target.is_file() or target.is_symlink():
                   continue
               with target.open("rb") as stream:
-                  if stream.read(8) == b"FWENC003":
-                      continue
+                  signature = stream.read(8)
+              if signature in {b"FWENC003", b"FWENC004"}:
+                  continue
               source = source_copy / rel
-              if not source.is_file():
+              if not source.is_file() or source.is_symlink():
                   raise SystemExit(f"Decrypted build copy is missing tracked file: {rel}")
               candidates.append((rel, target, source))
 
-          if not candidates:
-              print("All eligible mockup app files are already encrypted.")
+          workflow_source = workspace / ".github" / "workflows" / "ferroworks-encrypted-recovery.yaml"
+          if not workflow_source.is_file() or workflow_source.is_symlink():
+              raise SystemExit("The active workflow source is missing or is not a regular file.")
+          workflow_snapshot_source = source_copy / ".github" / "workflows" / "ferroworks-encrypted-recovery.yaml"
+          workflow_snapshot_enabled = os.environ.get("BACKUP_ENCRYPT_WORKFLOW", "false").lower() == "true"
+          if workflow_snapshot_enabled and not workflow_snapshot_source.is_file():
+              raise SystemExit("Workflow self-encryption was enabled but the isolated workflow snapshot is missing.")
+          workflow_digest = __import__("hashlib").sha256(workflow_source.read_bytes()).hexdigest()
+          workflow_backup = workspace / ".github" / "encrypted-backups" / f"workflow-{workflow_digest}.fwenc"
+          needs_workflow_backup = workflow_snapshot_enabled and not workflow_backup.exists()
+          if not candidates and not needs_workflow_backup:
+              print("No plaintext tracked app files or new enabled workflow snapshot need encryption.")
               raise SystemExit(0)
 
+          public_key_text = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
           public_keys = sorted((workspace / ".github" / "backup-recipients").glob("*.pem"))
-          temporary_dir = Path(tempfile.mkdtemp(prefix="fw-pages-encrypt-", dir=os.environ["RUNNER_TEMP"]))
-          os.chmod(temporary_dir, 0o700)
+          if not public_key_text and not public_keys:
+              raise SystemExit(
+                  "Pages deployed, but source remains plaintext: configure BACKUP_RECIPIENT_PUBLIC_KEY "
+                  "or add recipient PEM files under .github/backup-recipients/."
+              )
+          if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
+              raise SystemExit(
+                  "Pages deployed, but source remains plaintext: configure BACKUP_DECRYPT_PRIVATE_KEY "
+                  "as a repository secret."
+              )
+
+          work = Path(tempfile.mkdtemp(prefix="fw-pages-encrypt-", dir=temp_root))
+          os.chmod(work, 0o700)
+          staged = work / "staged"
+          staged.mkdir(mode=0o700)
+          private_key = work / "private.pem"
+          passphrase_file = work / "passphrase.txt"
+          private_key.write_text(os.environ["BACKUP_DECRYPT_PRIVATE_KEY"], encoding="utf-8")
+          passphrase_file.write_text(os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\r\n"), encoding="utf-8")
+          os.chmod(private_key, 0o600)
+          os.chmod(passphrase_file, 0o600)
           try:
-              configured_public = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
-              if configured_public:
-                  configured_path = temporary_dir / "configured-recipient.pem"
-                  configured_path.write_text(configured_public, encoding="utf-8")
-                  os.chmod(configured_path, 0o600)
-                  public_keys.append(configured_path)
-              if not public_keys:
-                  raise SystemExit(
-                      "Pages deployed, but source remains plaintext: configure BACKUP_RECIPIENT_PUBLIC_KEY "
-                      "or add a public PEM under .github/backup-recipients/."
-                  )
-
-              private_key_text = os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", "")
-              if not private_key_text:
-                  raise SystemExit(
-                      "Pages deployed, but source remains plaintext: add BACKUP_DECRYPT_PRIVATE_KEY "
-                      "as a repository secret before enabling source encryption."
-                  )
-              private_key = temporary_dir / "private.pem"
-              passphrase_file = temporary_dir / "passphrase.txt"
-              private_key.write_text(private_key_text, encoding="utf-8")
-              passphrase_file.write_text(
-                  os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\n") + "\n",
-                  encoding="utf-8",
-              )
-              os.chmod(private_key, 0o600)
-              os.chmod(passphrase_file, 0o600)
-
               public_args = []
-              for key in public_keys:
-                  public_args.extend(["--public-key", str(key)])
+              if public_key_text:
+                  configured = work / "configured-recipient.pem"
+                  configured.write_text(public_key_text, encoding="utf-8")
+                  os.chmod(configured, 0o600)
+                  public_keys.append(configured)
+              for public_key in public_keys:
+                  public_args.extend(["--public-key", str(public_key)])
 
-              # Confirm the configured private key can decrypt a new file before
-              # replacing any source files in the checked-out branch.
-              test_input = temporary_dir / "key-check.txt"
-              test_encrypted = temporary_dir / "key-check.fwenc"
-              test_input.write_text("FERROWORKS Pages key check\n", encoding="utf-8")
-              subprocess.run(
-                  [
-                      sys.executable, str(helper), "encrypt",
-                      "--input", str(test_input), "--output", str(test_encrypted),
-                      *public_args,
-                  ],
-                  check=True,
-              )
-              subprocess.run(
-                  [
-                      sys.executable, str(helper), "decrypt",
-                      "--private-key", str(private_key),
-                      "--passphrase-file", str(passphrase_file),
-                      "--input", str(test_encrypted),
-                      "--verify-only",
-                  ],
-                  check=True,
-              )
+              # Prove the configured decrypt key is a recipient before touching tracked files.
+              check_plain = work / "key-check.txt"
+              check_cipher = work / "key-check.fwenc"
+              check_plain.write_text("FERROWORKS FWENC004 key check\n", encoding="utf-8")
+              subprocess.run([
+                  sys.executable, str(helper), "encrypt", "--input", str(check_plain),
+                  "--output", str(check_cipher), *public_args,
+              ], check=True)
+              subprocess.run([
+                  sys.executable, str(helper), "decrypt", "--private-key", str(private_key),
+                  "--passphrase-file", str(passphrase_file), "--input", str(check_cipher),
+                  "--output", str(work / "key-check-decrypted.txt"),
+              ], check=True)
 
               for rel, target, source in candidates:
-                  fd, temporary_name = tempfile.mkstemp(prefix=".fwenc-", dir=target.parent)
-                  os.close(fd)
-                  temporary = Path(temporary_name)
-                  temporary.unlink()
-                  try:
-                      subprocess.run(
-                          [
-                              sys.executable, str(helper), "encrypt",
-                              "--input", str(source), "--output", str(temporary),
-                              *public_args,
-                          ],
-                          check=True,
-                      )
-                      os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
-                      os.replace(temporary, target)
-                      subprocess.run(
-                          ["git", "add", "--", ":(literal)" + rel.as_posix()],
-                          cwd=workspace, check=True,
-                      )
-                  finally:
-                      temporary.unlink(missing_ok=True)
-          finally:
-              for child in temporary_dir.iterdir():
-                  child.unlink(missing_ok=True)
-              temporary_dir.rmdir()
+                  staged_path = staged / rel.relative_to(site_rel)
+                  staged_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                  subprocess.run([
+                      sys.executable, str(helper), "encrypt", "--input", str(source),
+                      "--output", str(staged_path), *public_args,
+                  ], check=True)
+                  os.chmod(staged_path, stat.S_IMODE(target.stat().st_mode))
 
-          print(f"Encrypted {len(candidates)} mockup app file(s) after deployment.")
+              # Preserve an encrypted, authenticated snapshot of this workflow on every workflow revision.
+              if needs_workflow_backup:
+                  staged_workflow = staged / "workflow-snapshot.fwenc"
+                  subprocess.run([
+                      sys.executable, str(helper), "encrypt", "--input", str(workflow_source),
+                      "--output", str(staged_workflow), *public_args,
+                  ], check=True)
+                  os.chmod(staged_workflow, 0o600)
+
+              # Only start replacing tracked sources after every output encrypted successfully.
+              for rel, target, _source in candidates:
+                  os.replace(staged / rel.relative_to(site_rel), target)
+                  subprocess.run(
+                      ["git", "add", "--", ":(literal)" + rel.as_posix()],
+                      cwd=workspace, check=True,
+                  )
+              if needs_workflow_backup:
+                  workflow_backup.parent.mkdir(parents=True, exist_ok=True)
+                  os.replace(staged / "workflow-snapshot.fwenc", workflow_backup)
+                  subprocess.run(
+                      ["git", "add", "--", ":(literal)" + workflow_backup.relative_to(workspace).as_posix()],
+                      cwd=workspace, check=True,
+                  )
+          finally:
+              for path in sorted(work.rglob("*"), reverse=True):
+                  if path.is_file() or path.is_symlink():
+                      path.unlink(missing_ok=True)
+                  elif path.is_dir():
+                      path.rmdir()
+              work.rmdir()
+
+          print(f"Encrypted {len(candidates)} tracked app file(s) after deployment.")
           PYENCRYPT
 
-          if ! git diff --cached --quiet -- artifacts/mockup-sandbox; then
+          if ! git diff --cached --quiet -- artifacts/mockup-sandbox .github/encrypted-backups; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -m "[FERROWORKS] Encrypt Pages source after deploy [skip ci]"
