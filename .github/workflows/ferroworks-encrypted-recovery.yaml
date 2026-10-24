@@ -611,41 +611,58 @@ jobs:
               print("No plaintext tracked app files or new enabled workflow snapshot need encryption.")
               raise SystemExit(0)
 
-          public_key_text = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
-          public_keys = sorted((workspace / ".github" / "backup-recipients").glob("*.pem"))
-          if not public_key_text and not public_keys:
-              print("No encryption recipients configured; leaving Pages source as plaintext.")
-              raise SystemExit(0)
-          if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
-              raise SystemExit(
-                  "Pages deployed, but source remains plaintext: configure BACKUP_DECRYPT_PRIVATE_KEY "
-                  "as a repository secret alongside BACKUP_RECIPIENT_PUBLIC_KEY to encrypt tracked files."
-              )
-          if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
-              raise SystemExit(
-                  "Pages deployed, but source remains plaintext: configure BACKUP_DECRYPT_PRIVATE_KEY "
-                  "as a repository secret."
-              )
-
           work = Path(tempfile.mkdtemp(prefix="fw-pages-encrypt-", dir=temp_root))
           os.chmod(work, 0o700)
           staged = work / "staged"
           staged.mkdir(mode=0o700)
           private_key = work / "private.pem"
           passphrase_file = work / "passphrase.txt"
-          private_key.write_text(os.environ["BACKUP_DECRYPT_PRIVATE_KEY"], encoding="utf-8")
+          private_key.write_text(os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""), encoding="utf-8")
           passphrase_file.write_text(os.environ.get("BACKUP_DECRYPT_PASSPHRASE", "").rstrip("\r\n"), encoding="utf-8")
           os.chmod(private_key, 0o600)
           os.chmod(passphrase_file, 0o600)
+
+          public_key_text = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
+          public_keys = []
+          if public_key_text:
+              configured = work / "configured-recipient.pem"
+              configured.write_text(public_key_text, encoding="utf-8")
+              os.chmod(configured, 0o600)
+              public_keys.append(configured)
+          for key_path in sorted((workspace / ".github" / "backup-recipients").glob("*.pem")):
+              public_keys.append(key_path)
+
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          def load_public_key(path):
+              try:
+                  key = serialization.load_pem_public_key(path.read_bytes())
+              except Exception:
+                  return None
+              if not isinstance(key, rsa.RSAPublicKey) or key.key_size < 3072 or key.key_size > 8192:
+                  return None
+              return key
+
+          valid_keys = []
+          for key_path in public_keys:
+              if load_public_key(key_path) is not None:
+                  valid_keys.append(key_path)
+              else:
+                  print(f"Skipping invalid recipient key: {key_path}")
+
+          if not valid_keys:
+              print("No valid encryption recipient keys configured; leaving Pages source as plaintext.")
+              raise SystemExit(0)
+          if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
+              raise SystemExit(
+                  "Pages deployed, but source remains plaintext: configure BACKUP_DECRYPT_PRIVATE_KEY "
+                  "as a repository secret alongside a valid BACKUP_RECIPIENT_PUBLIC_KEY."
+              )
           try:
               public_args = []
-              if public_key_text:
-                  configured = work / "configured-recipient.pem"
-                  configured.write_text(public_key_text, encoding="utf-8")
-                  os.chmod(configured, 0o600)
-                  public_keys.append(configured)
-              for public_key in public_keys:
-                  public_args.extend(["--public-key", str(public_key)])
+              for key_path in valid_keys:
+                  public_args.extend(["--public-key", str(key_path)])
 
               # Prove the configured decrypt key is a recipient before touching tracked files.
               check_plain = work / "key-check.txt"
