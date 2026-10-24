@@ -540,6 +540,7 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
 
       - name: Encrypt app source after successful deployment
+        if: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY != '' || secrets.BACKUP_RECIPIENT_PUBLIC_KEY != '' }}
         shell: bash
         env:
           BACKUP_RECIPIENT_PUBLIC_KEY: ${{ vars.BACKUP_RECIPIENT_PUBLIC_KEY || secrets.BACKUP_RECIPIENT_PUBLIC_KEY }}
@@ -614,9 +615,12 @@ jobs:
           public_key_text = os.environ.get("BACKUP_RECIPIENT_PUBLIC_KEY", "")
           public_keys = sorted((workspace / ".github" / "backup-recipients").glob("*.pem"))
           if not public_key_text and not public_keys:
+              print("No encryption recipients configured; leaving Pages source as plaintext.")
+              raise SystemExit(0)
+          if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
               raise SystemExit(
-                  "Pages deployed, but source remains plaintext: configure BACKUP_RECIPIENT_PUBLIC_KEY "
-                  "or add recipient PEM files under .github/backup-recipients/."
+                  "Pages deployed, but source remains plaintext: configure BACKUP_DECRYPT_PRIVATE_KEY "
+                  "as a repository secret alongside BACKUP_RECIPIENT_PUBLIC_KEY to encrypt tracked files."
               )
           if not os.environ.get("BACKUP_DECRYPT_PRIVATE_KEY", ""):
               raise SystemExit(
